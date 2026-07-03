@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# Prompt-Z mainline 12-case sweep using the default B recipe.
+#
+# Cases:
+#   datasets: ECL, Traffic, ETTh1
+#   horizons: 1, 24, 48, 96
+#
+# Total:
+#   12 cases
+#
+# This delegates to run_prompt_z_complete.sh, so all knobs can still be
+# overridden through environment variables.
+# ==============================================================================
+
+RUN_TAG=${RUN_TAG:-main_B_12cases}
+WEIGHT_TAG=${WEIGHT_TAG:-$RUN_TAG}
+SELECTED_ONLY=${SELECTED_ONLY:-0}
+
+CASES=${CASES:-"\
+ECL.csv:1:321 ECL.csv:24:321 ECL.csv:48:321 ECL.csv:96:321 \
+Traffic.csv:1:862 Traffic.csv:24:862 Traffic.csv:48:862 Traffic.csv:96:862 \
+ETTh1.csv:1:7 ETTh1.csv:24:7 ETTh1.csv:48:7 ETTh1.csv:96:7"}
+
+MAX_DELTA_RATIO=${MAX_DELTA_RATIO:-0.05}
+GAMMA_INIT_BIAS=${GAMMA_INIT_BIAS:--3.0}
+MASK_INIT_BIAS=${MASK_INIT_BIAS:--1.5}
+LAMBDA_DELTA=${LAMBDA_DELTA:-0.0002}
+LAMBDA_MASK=${LAMBDA_MASK:-0.0001}
+LAMBDA_NOOP=${LAMBDA_NOOP:-0.005}
+TARGET_MASK_RATIO=${TARGET_MASK_RATIO:-0.10}
+REG_WARMUP_STEPS=${REG_WARMUP_STEPS:-2000}
+NOOP_WARMUP_STEPS=${NOOP_WARMUP_STEPS:-14000}
+NOOP_RAMP_STEPS=${NOOP_RAMP_STEPS:-2000}
+GAMMA_FLOOR=${GAMMA_FLOOR:-0.1}
+GAMMA_FLOOR_STEPS=${GAMMA_FLOOR_STEPS:-8000}
+MASK_FLOOR=${MASK_FLOOR:-0.05}
+MASK_FLOOR_STEPS=${MASK_FLOOR_STEPS:-12000}
+DELAYED_RESIDUAL_TRAINING=${DELAYED_RESIDUAL_TRAINING:-1}
+ENABLE_VALIDATION_FALLBACK=${ENABLE_VALIDATION_FALLBACK:-1}
+FALLBACK_MARGIN=${FALLBACK_MARGIN:-0.005}
+VAL_RATIO=${VAL_RATIO:-0.1}
+VALIDATION_STEPS=${VALIDATION_STEPS:-}
+FALLBACK_MODE=${FALLBACK_MODE:-mode0}
+
+export RUN_TAG CASES
+export WEIGHT_TAG SELECTED_ONLY
+export MAX_DELTA_RATIO GAMMA_INIT_BIAS MASK_INIT_BIAS
+export LAMBDA_DELTA LAMBDA_MASK LAMBDA_NOOP TARGET_MASK_RATIO
+export REG_WARMUP_STEPS NOOP_WARMUP_STEPS NOOP_RAMP_STEPS
+export GAMMA_FLOOR GAMMA_FLOOR_STEPS MASK_FLOOR MASK_FLOOR_STEPS
+export DELAYED_RESIDUAL_TRAINING ENABLE_VALIDATION_FALLBACK
+export FALLBACK_MARGIN VAL_RATIO VALIDATION_STEPS FALLBACK_MODE
+
+echo "================================================================="
+echo " Prompt-Z Mainline 12 Cases (B Recipe)"
+echo "================================================================="
+echo "RUN_TAG=${RUN_TAG}"
+echo "WEIGHT_TAG=${WEIGHT_TAG}"
+echo "SELECTED_ONLY=${SELECTED_ONLY}"
+echo "CASES=${CASES}"
+echo "MAX_DELTA_RATIO=${MAX_DELTA_RATIO}"
+echo "LAMBDA_DELTA=${LAMBDA_DELTA} LAMBDA_MASK=${LAMBDA_MASK} LAMBDA_NOOP=${LAMBDA_NOOP} TARGET_MASK_RATIO=${TARGET_MASK_RATIO}"
+echo "GAMMA_FLOOR=${GAMMA_FLOOR} GAMMA_FLOOR_STEPS=${GAMMA_FLOOR_STEPS}"
+echo "MASK_FLOOR=${MASK_FLOOR} MASK_FLOOR_STEPS=${MASK_FLOOR_STEPS}"
+echo "DELAYED_RESIDUAL_TRAINING=${DELAYED_RESIDUAL_TRAINING}"
+echo "ENABLE_VALIDATION_FALLBACK=${ENABLE_VALIDATION_FALLBACK} FALLBACK_MARGIN=${FALLBACK_MARGIN}"
+echo "================================================================="
+
+bash scripts/run_prompt_z_complete.sh

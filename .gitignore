@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local tooling
+.agents/
+.claude/
+
+# Project runtime artifacts
+environment/
+logs/
+weights/
+
+# Datasets and generated analysis outputs
+data/
+analysis/
+
+# Common local environment files
+.env
+.venv/
+venv/
