@@ -340,11 +340,12 @@ class iTransformerAdapter(BackboneAdapter):
 
         # Projection: [B, C, D] → [B, C, pred_len] → [B, pred_len, C]
         dec_out = self.backbone.projection(enc_out)            # [B, C, pred_len]
-        dec_out = dec_out.permute(0, 2, 1)                     # [B, pred_len, C]
+        C = enc_out.shape[1]
+        dec_out = dec_out.permute(0, 2, 1)[:, :, :C]          # [B, pred_len, C]
 
         # Denormalization
-        dec_out = dec_out * stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1)
-        dec_out = dec_out + means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1)
+        dec_out = dec_out * stdev[:, 0, :C].unsqueeze(1).repeat(1, self.pred_len, 1)
+        dec_out = dec_out + means[:, 0, :C].unsqueeze(1).repeat(1, self.pred_len, 1)
         return dec_out                                         # [B, pred_len, C]
 
     # ------------------------------------------------------------------
@@ -355,25 +356,23 @@ class iTransformerAdapter(BackboneAdapter):
         """
         iTransformer: norm → embedding → encoder → [B, C, D].
         Hook is at encoder output, before projection head.
+        Delegates to backbone.encode_local() for consistency.
         """
-        means = X.mean(1, keepdim=True).detach()             # [B, 1, C]
-        x_norm = X - means
-        stdev = torch.sqrt(
-            torch.var(x_norm, dim=1, keepdim=True, unbiased=False) + 1e-5
-        ).detach()                                            # [B, 1, C]
-        x_norm = x_norm / stdev
-        enc_out = self.backbone.enc_embedding(x_norm, None)   # [B, C, D]
-        enc_out, _ = self.backbone.encoder(enc_out)           # [B, C, D]
+        # backbone.encode_local() handles normalization, embedding, encoder
+        enc_out, means, stdev = self.backbone.encode_local(X)  # [B, C, D], [B,1,C], [B,1,C]
         return enc_out, means, stdev
 
     def decode_from_hook(
         self, hidden: Tensor, means: Tensor, stdev: Tensor,
     ) -> Tensor:
-        """iTransformer: projection([B, C, D]) → [B, pred_len, C]."""
-        dec_out = self.backbone.projection(hidden)            # [B, C, pred_len]
-        dec_out = dec_out.permute(0, 2, 1)                    # [B, pred_len, C]
-        dec_out = dec_out * stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1)
-        dec_out = dec_out + means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1)
+        """iTransformer: projection([B, C, D]) → [B, pred_len, C].
+        Channel slice [:,:,:C] matches original forecast() behavior.
+        """
+        C = hidden.shape[1]
+        dec_out = self.backbone.projection(hidden)             # [B, C, pred_len]
+        dec_out = dec_out.permute(0, 2, 1)[:, :, :C]          # [B, pred_len, C]
+        dec_out = dec_out * stdev[:, 0, :C].unsqueeze(1).repeat(1, self.pred_len, 1)
+        dec_out = dec_out + means[:, 0, :C].unsqueeze(1).repeat(1, self.pred_len, 1)
         return dec_out
 
     @property

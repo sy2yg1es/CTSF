@@ -1,0 +1,933 @@
+Battling the Non-stationarity in Time Series Forecasting via Test-time Adaptation
+HyunGi Kim1, Siwon Kim1, Jisoo Mok1, Sungroh Yoon1, 2, 3 †
+1Department of Electrical and Computer Engineering, Seoul National University
+2Interdisciplinary Program in Artificial Intelligence, Seoul National University
+3AIIS, ASRI, and INMC, Seoul National University
+rlagusrl0128@snu.ac.kr, tuslkk17@gmail.com, magicshop1118@snu.ac.kr, sryoon@snu.ac.kr
+Abstract
+Deep Neural Networks have spearheaded remarkable ad-
+vancements in time series forecasting (TSF), one of the ma-
+jor tasks in time series modeling. Nonetheless, the non-
+stationarity of time series undermines the reliability of pre-
+trained source time series forecasters in mission-critical de-
+ployment settings. In this study, we introduce a pioneering
+test-time adaptation framework tailored for TSF (TSF-TTA).
+TAFAS, the proposed approach to TSF-TTA, flexibly adapts
+source forecasters to continuously shifting test distributions
+while preserving the core semantic information learned dur-
+ing pre-training. The novel utilization of partially-observed
+ground truth and gated calibration module enables proactive,
+robust, and model-agnostic adaptation of source forecast-
+ers. Experiments on diverse benchmark datasets and cutting-
+edge architectures demonstrate the efficacy and generality
+of TAFAS, especially in long-term forecasting scenarios that
+suffer from significant distribution shifts.
+Code — https://github.com/kimanki/TAFAS
+Introduction
+Time series forecasting (TSF), which is one of the most
+core tasks in time series modeling, aims to predict future
+values based on historical data points. The widespread ap-
+plications of TSF across various industries include but are
+not limited to: weather prediction (Verma, Heinonen, and
+Garg 2024), traffic forecasting (Liu et al. 2023), stock mar-
+ket prediction (Li et al. 2023), and supply chain manage-
+ment (Hosseinnia Shavaki and Ebrahimi Ghahnavieh 2023).
+Such a broad and over-arching impact of TSF results high-
+lights the importance of developing a dependable time se-
+ries forecaster, whose predictions maintain reliability de-
+spite changes in external factors.
+A critical bottleneck in the reliable deployment of pre-
+trained time series forecasters is created by the non-
+stationary nature of real-world time series data that leads to
+continuous data distribution shifts (Petropoulos et al. 2022).
+Previous works on alleviating the effect of non-stationarity
+Copyright © 2025, Association for the Advancement of Artificial
+Intelligence (www.aaai.org). All rights reserved.
+† Corresponding Author
+TAFAS Full GT AdaptGT
+(b) Proactive Adaptation with POGT
+POGT
+Forecasting Time StepsMSE Test Data
+(a) Test-time Failure of 
+a Source Forecaster
+Forecasting WindowLook-back
+Window Full GT
+Figure 1: (a) The performance of a pre-trained source fore-
+caster degrades when it encounters distribution-shifted in-
+puts at test-time. In the figure, the distribution shift occurs
+through the gradual increase of mean value. (b) The sequen-
+tial nature of time series provides the opportunity to proac-
+tively adapt the forecaster with partially-observed ground
+truth (POGT) before acquiring full ground truth (GT).
+aim to improve the robustness of time series forecasters
+through advancements in the pre-training process (Kim et al.
+2021; Fan et al. 2023; Liu et al. 2024b). Unfortunately,
+as the non-stationarity worsens the distributional discrep-
+ancy between training and test data over time, the pre-
+trained forecaster becomes increasingly unreliable, even if
+it has learned meaningful temporal semantics from training
+data (Kuznetsov and Mohri 2014). In Figure 1(a), we visu-
+alize how constantly evolving, non-stationary test data neg-
+atively affect the forecasting results of a pre-trained time se-
+ries forecaster.
+This shortcoming of existing approaches underscores the
+need to continuously adapt the pre-trained source forecaster
+on shifted test-time inputs while preserving its core se-
+mantics. Adapting the source forecaster to incorporate new
+time-variant semantics within test-time inputs allows it to
+reflect the ever-changing test distributions. In this regard,
+we pioneer a test-time adaptation (TTA) framework tailored
+for TSF (TSF-TTA). TTA, which has been primarily stud-
+ied in the computer vision domain under classification set-
+tings (Wang et al. 2021; Niu et al. 2022, 2023; Lee et al.
+2024), dynamically adjusts a pre-trained classifier on test in-
+puts; this objective of TTA makes it well-aligned with the
+aforementioned motivation of adapting the source forecaster
+to newly arriving test data. Traditionally, TTA has operated
+under two main assumptions on the nature of test inputs.
+The Thirty-Ninth AAAI Conference on Artificial Intelligence (AAAI-25)
+17868
+
+First, TTA assumes a complete absence of test labels be-
+cause it is infeasible to hand annotate inputs at test-time.
+Second, because most of the image data are assumed to be
+Independent and Identically Distributed (IID), TTA gener-
+ally operates under the same IID assumption. In TSF-TTA,
+however, these assumptions no longer hold due to the intrin-
+sic characteristics of time series data.
+Unlike the first assumption of TTA, in TSF-TTA, ground
+truth for predicted time steps eventually becomes accessi-
+ble, albeit in a delayed manner. For instance, when predict-
+ing electricity consumption for the next 30 days, the actual
+amount of electricity consumption becomes known to us af-
+ter 30 days. Interestingly, as depicted in Figure 1(b), the
+sequential nature of time series makes ground truth values
+partially observable before acquiring the full ground truth.
+In the aforementioned example, the partial ground truth for
+the first 7 days is obtainable only after a week. Utilizing this
+partially-observable ground truth offers an invaluable oppor-
+tunity to preemptively perform TSF-TTA prior to the arrival
+of full ground truth. Moreover, the second assumption is vi-
+olated in TSF-TTA because temporal dependency exists in
+time series. This necessitates a technique for addressing the
+non-IIDness of time series on local (within window) and
+global (throughout the entire test-time) levels.
+By considering these challenges and opportunities pre-
+sented by properties of time series, we propose a Test-
+time Adaptive ForecAsting for non-stationary time Series
+(TAFAS) that is extensible to various TSF architectures.
+TAFAS consists of periodicity-aware adaptation scheduling
+(PAAS) and a gated calibration module (GCM). PAAS adap-
+tively obtains partially-observed ground truth of sufficient
+length to represent semantically meaningful periodic pat-
+terns. After then, model-agnostic GCMs are adapted to cal-
+ibrate test-time inputs such that they conform to the distri-
+bution the source forecaster effectively handles. The gating
+mechanism in GCMs controls how much the calibrated re-
+sults should be utilized by considering global distribution
+shifts. Together, PAAS and GCM allow the source forecaster
+to be proactively adapted on non-stationary test-time inputs.
+Throughout the adaptation, the source forecaster remains
+frozen to preserve the core semantics it has learned from
+the extensive historical data. With the proactively adapted
+forecaster, TAFAS adjusts the latter part of the original pre-
+dictions, where ground truths are yet to be observed, with
+the adapted predictions reflecting the distribution shift.
+Comprehensive experimental results demonstrate that the
+TAFAS consistently enhances forecasting capabilities across
+source forecasters of various architectures. TAFAS leads
+to particularly large performance gains in long-term fore-
+casting scenarios where distribution shifts become more
+pronounced. Moreover, the seamless integration of TAFAS
+with methods addressing the non-stationarity in pre-training
+stage and time series foundation models further enhances
+their ability to navigate test-time distribution shifts. Notably,
+TAFAS improves the forecasting error of Chronos (Ansari
+et al. 2024) on unseen test data streams by up to 45%.
+Our contributions are summarized as follows:
+• We pioneer test-time adaptation in time series forecasting
+(TSF-TTA) to address the non-stationarity in time series.
+Our examination of the properties of time series reveals
+the challenges in extending existing TTA frameworks to
+TSF, necessitating a new avenue to enable TSF-TTA.
+• We introduce TAFAS, a model-agnostic TSF-TTA
+framework that consists of periodicity-aware adapta-
+tion scheduling (PAAS) and Gated Calibration Module
+(GCM). These two technical components collectively en-
+able proactive adaptation of the source forecaster on test-
+time inputs while preserving its core semantics.
+• TAFAS consistently excels in test-time adaptation across
+various TSF benchmark datasets and architectures, sig-
+nificantly improving test errors on highly non-stationary
+data and in long-term forecasting scenarios.
+Related Works
+As TSF has become a pivotal application in various indus-
+tries, diverse TSF architectures have been developed. Due
+to the page limit, an exhaustive discussion on TSF archi-
+tectures and TTA is included in Appendix. Here, we focus
+on studies that improve the time series forecaster by miti-
+gating distribution shifts caused by the non-stationarity of
+time series. A line of studies introduces normalization and
+de-normalization modules before and after the forecaster to
+remove and restore the non-stationary statistics (Kim et al.
+2021; Liu et al. 2022; Fan et al. 2023; Liu et al. 2024b).
+RevIN (Kim et al. 2021) performs instance normalization
+with learnable scale and bias factors, whereas NST (Liu et al.
+2022) uses a non-parametric approach without learnable
+transformations. Dish-TS (Fan et al. 2023) and SAN (Liu
+et al. 2024b) perform statistical prediction both within the
+look-back window and between the look-back and predic-
+tion windows to appropriately execute normalization and
+denormalization. However, their generalization capability to
+the continuously evolving test data distribution is inherently
+limited as they address non-stationarity only within train-
+ing distributions. Although TSF-TTA and online TSF share
+a common ground in learning from streaming inputs (Wen
+et al. 2024; Ao and Fayek 2023; Guo et al. 2016; Pham
+et al. 2023), their primary objectives are fundamentally dif-
+ferent. Online TSF aims to train a time series forecaster from
+scratch with streaming data, but TSF-TTA aims to adapt a
+pre-trained source forecaster.
+Challenges and Opportunities in TSF-TTA
+Generally, TTA leverages unlabeled test-time inputs to adapt
+classifiers on shifted distributions. In this study, we aim to
+extend TTA to TSF to improve the ability of the pre-trained
+source time series forecaster to handle newly arriving test
+data. While the task characteristics of TSF and the properties
+of time series make applying the existing TTA frameworks
+to TSF a non-trivial problem, they also open new doors to
+develop a tailored approach to TSF-TTA. In this section, we
+highlight the challenges (C) and opportunities (O) unique to
+TSF-TTA after introducing task definition and formulations.
+Task definition & formulations. TSF is the task of
+predicting the future horizon window of H time steps
+({xt+1, ..., xt+H }) given the past look-back window of L
+time steps ({xt−L+1, ..., xt}). xt ∈ RC denotes C number
+17869
+
+of variables observed at time t. To perform TSF, a time se-
+ries forecaster Fθ: RL×C → RH×C is trained to predict
+subsequent future H time steps given L past time steps.
+The train, validation, and test sets of TSF datasets
+are obtained by splitting a single continuous time se-
+ries {x1, ..., xT } in chronological order. Then, the
+(past, future) pairs are obtained using a sliding window,
+i.e., (Xt, Yt) = ( {xt−L+1, ..., xt}, {xt+1, ..., xt+H }). In
+non-stationary time series, data distribution continuously
+changes over time, resulting in distribution shifts between
+data splits and also within each split.
+C1. Entropy-based TTA losses are infeasible for
+regression-based TSF. TTA fundamentally assumes that
+ground truth labels are not available. Therefore, existing
+TTA methods utilize the entropy of predicted class proba-
+bility distributions to formulate objective functions for the
+adaptation (Wang et al. 2021; Niu et al. 2022; Lee et al.
+2024). However, TSF is a regression task, where the entropy
+of class probabilities is ill-defined, rendering the straightfor-
+ward extension of entropy-based losses impossible.
+O1. Ground truth is accessible in TSF. In TSF, ground
+truth values become accessible as the predicted future time
+steps eventually arrive. Therefore, instead of entropy-based
+losses, the Mean Squared Error (MSE) loss, the de facto ob-
+jective function used for regression tasks, can be used as a
+learning signal to perform TSF-TTA.
+C2. Full ground truth is accessible in a delayed time,
+resulting in a delayed adaptation.However, computing the
+MSE loss after observing full ground truth results in a delay
+of H time steps between the point of forecasting (t) and ob-
+taining the full ground truth (t ′ = t + H). Thus, na ¨ıvely
+waiting for the arrival of full ground truth to perform TSF-
+TTA implies that none of the forecasted predictions in H
+time steps can be adapted. As the length of the forecasting
+window increases, the point at which full ground truth be-
+comes obtainable is further delayed. This further delay in
+the point of adaptation inhibits performing TSF-TTA in a
+timely manner to reflect the adjacent distribution shifts.
+O2. Utilizing partially-observed ground truth enables
+proactive TSF-TTA. The sequential nature of test-time in-
+puts makes ground truth partially observable before acquir-
+ing the full ground truth. After p time steps (p < H ) from
+the forecasting time step t of Xt, the first p time steps out of
+the full ground truth (i.e., {xt+1, . . . ,xt+p} ∈ Rp×C) are
+observable. Replacing the full ground truth in the MSE loss
+with its partially-observed counterpart reduces the adapta-
+tion delay and thus enables proactive adaptation.
+TAFAS: Test-time Adaptive Forecasting for
+Non-stationary Time Series
+In this section, we introduce TAFAS, a novel framework that
+considers the challenges and opportunities of TSF-TTA. The
+overall pipeline of TAFAS is provided in Figure 2.
+Periodicity-Aware Adaptation Scheduling (PAAS)
+To enable a proactive adaptation of the pre-trained source
+forecaster by reducing the adaptation delay, in TAFAS, we
+utilize partially-observed ground truth (POGT). However, as
+stated in Section O2., POGT does not eliminate the adapta-
+tion delay because to obtain POGT of length p, we must
+wait for p time steps. Therefore, choosing the appropriate
+value of p is important for balancing the trade-off between
+the amount of semantic information in POGT and the adap-
+tation delay. Whenp is large, the POGT contains copious se-
+mantic information, but the adaptation delay increases, off-
+setting the advantage of employing the POGT. Conversely,
+when p is small, the forecaster can be adapted more proac-
+tively, but the POGT may contain meaningless patterns.
+To ensure that the POGT incorporates semantically mean-
+ingful temporal patterns while preventing an excessive time
+delay, we introduce a periodicity-aware adaptation schedul-
+ing (PAAS) scheme that reflects the inherent periodic pat-
+terns of the test-time inputs. Several studies have demon-
+strated that the look-back window contains meaningful pe-
+riodic patterns (Wu et al. 2023, 2021). PAAS thus extracts
+these patterns from the look-back window to determine p.
+From here on, t0 denotes the time step at which the first test-
+time look-back window is obtained. PAAS applies variable-
+wise Fast Fourier Transform (FFT) on the first look-back
+window Xt0 to identify the variable with the highest signal
+power (Eq. 1). Before FFT, the mean of Xt0 is set to zero
+to remove the influence of bias. For the identified variable
+c∗, PAAS calculates the amplitude of each frequency com-
+ponent to determine the dominant frequency (Eq. 2).
+c∗ = arg max
+c
+X
+f
+∥FFT(X c
+t0 )∥2 (1)
+f ∗ = arg max
+f
+∥FFT(X c∗
+t0 )∥2 (2)
+Based on the relationship between the frequency and period,
+PAAS derives the period of the dominant periodic patterns
+of Xt0 and set it to the length of POGT as pt0 =
+l
+L
+f ∗
+m
+. The
+resulting periodicity-aware POGT Yt0 [: pt0 ] includes rele-
+vant semantics embodied in the dominant periodic patterns.
+Once pt0 is determined, pt0 + 1 instances are aggregated
+into a test mini-batch: {X}
+t0+pt0
+t0 = {Xt0 , . . . ,Xt0+pt0
+}.
+When the subsequent look-back window arrives at time step
+t0 + pt0 + 1, PAAS is repeated to calculate the subsequent
+length of POGT adaptively. Considering the inherent peri-
+odic patterns vary across datasets and instances, the adaptive
+characteristic of PAAS assures data-agnostic TSF-TTA.
+Gated Calibration Module (GCM)
+Selecting the module to adapt is a critical design choice in
+TTA. Existing TTA methods generally adapt normalization
+layers, e.g., Batch Normalization (Ioffe and Szegedy 2015),
+to adjust the distributions of the intermediate features. How-
+ever, state-of-the-art TSF methods adopt various forms of ar-
+chitectures, many of which are missing such normalization
+layers. Hence, we introduce a model-agnostic Gated Cali-
+bration Module (GCM) to guarantee that TAFAS can be ap-
+plied generally to diverse pre-trained source forecasters.
+TAFAS adapts the GCM with the source forecaster frozen
+to preserve the core temporal semantics that the forecaster
+has learned from extensive historical data. GCM is attached
+17870
+
++
+Source Forecaster
+Unobserved Time Steps
+....... 
+tanh
+TC
++
+....
++
+Original Prediction
+POGT
+Adjusted Prediction
+Look-back Window
+Forecasting Window
+Output GCM2
+MSEtanh
+TC
++
+PAAS1
+Test 
+Mini-batch
+Recalculate & Adjust
+3
+Input GCM2
+Figure 2: An overview of TAFAS.(1: Blue) By computing the periodicity of dominant patterns for Xt∗, PAAS determines the
+length of partially-observed ground truth (POGT)pt∗. (2: Yellow)Then input and output GCMs are proactively adapted onXt∗
+at t∗ + pt∗ to mitigate local and global distribution shifts through Temporal Calibration (TC) and gating (tanh) mechanisms, by
+minimizing MSE between the POGT and corresponding prediction. The source forecaster is frozen to preserve its core semantic
+information learned. (3: Green) Following the proactive adaptation, predictions for test mini-batch{X}t∗+pt∗
+t∗ are recalculated
+to reflect the distribution shift and the unobserved part of the original predictions is adjusted with the adapted predictions.
+to both the front and tail ends of the source forecaster, re-
+ferred to as input and output GCMs. The input GCM maps
+the distribution-shifted test input Xt to a calibrated input
+Xcali
+t that belong in a distribution the source forecaster can
+handle. The output GCM remaps the source forecaster’s pre-
+diction ˆYt to ˆY cali
+t in order to calibrate ˆYt back to the con-
+tinuously changing test distribution.
+GCM consists of variable-wise temporal calibration and
+gating mechanisms to handle both the local (within the look-
+back window) and global (throughout the entire test-time)
+non-stationarity. The temporal calibration handles local dis-
+tribution shifts by transforming the given window to calcu-
+late calibrated results. The gating mechanism handles global
+distribution shifts by updating how much to reflect cali-
+brated results over time. Both temporal calibration and gat-
+ing mechanisms are applied variable-wise, since each vari-
+able can have a different degree of non-stationarity. The two
+operations in the input GCM are expressed as the following:
+GCM(Xt) = Xt+
+Tile(tanh(α)) ◦
+
+Concat({W cX c
+t }C
+c=1) + b
+
+, (3)
+where W c ∈ RL×L, b ∈ RL×C, and α ∈ RC. Tile(·) :
+RC → RL×C broadcasts the gating vector in a tempo-
+ral dimension, Concat(·) concatenates the calibrated signals
+along variable dimension, and ◦ denotes a Hadamard prod-
+uct. W c and b are initialized to be zero so that at the first test
+time step when the test data diverge little from the training
+distribution, the original input is passed without calibration.
+The mechanism of the output GCM follows Eq. 3 with Xt
+replaced with ˆYt, and the dimensions of W c and b adjusted
+accordingly to H × H and H × C.
+Let t∗ denote a time step at which PAAS calculates the
+POGT length (t0, t0 +pt0 +1, . . .) and pt∗ denote the POGT
+length computed at t∗. After a test mini-batch {X}t∗+pt∗
+t∗ is
+obtained at t∗ + pt∗, GCMs are adapted by minimizing the
+TAFAS loss defined as the following:
+Lpartial = MSE( ˆY cali
+t∗ [: pt∗ ] , Yt∗ [: pt∗ ]) (4)
+Lfull = MSE({ ˆY cali}
+˜t∗+p˜t∗
+˜t∗ , {Y }
+˜t∗+p˜t∗
+˜t∗ ) (5)
+LTAFAS = Lpartial + Lfull, (6)
+where ˜t∗ represents the most recent time step among the past
+POGT-computing steps whose corresponding mini-batches
+have now observed their full ground truths. Lpartial is com-
+puted between the first pt∗ time steps of the calibrated pre-
+diction for Xt∗ whose periodicity-aware POGT is available
+( ˆY cali
+t∗ [: pt∗ ]) and the corresponding POGT (Yt∗ [: pt∗ ]).
+Lfull is calculated between the calibrated predictions of all
+look-back windows within the past mini-batch constructed
+at ˜t∗ + p˜t∗ and the associated full ground truths to use their
+longer semantic information for adaptation. This adaption
+process of TAFAS enables proactive adaptation right when
+the semantically meaningful POGT is obtained while utiliz-
+ing the extended semantic details from the full ground truths
+of the past mini-batch. When no past mini-batch with full
+ground truths is available, e.g., at the beginning of the adap-
+tation phase, TAFAS uses onlyLpartial for adaptation.
+Prediction Adjustment (PA)
+Because the forecaster is proactively adapted, TAFAS can
+replace the latter part of original predictions, whose ground
+truths are yet to be observed, with adjusted predictions that
+reflect the distribution shift. After the forecaster is adapted
+at t∗ + pt∗, TAFAS recalculates the predictions for all look-
+back windows in {X}t∗+pt∗
+t∗ and then substitutes the origi-
+nal predictions for time steps after t∗ + pt∗ with the adapted
+predictions. Specifically, for the look-back window Xt∗+k,
+where k ∈ {0, . . . , pt∗ }, the corresponding prediction ˆY cali
+t∗+k
+predicts time steps {(t∗ + k + 1), . . . ,(t∗ + k + H)}. For
+the time steps {(t∗ + pt∗ + 1), . . . ,(t∗ + k + H)} which
+are yet to be observed, TAFAS substitutes the original pre-
+diction ˆY cali
+t∗+k with the adapted prediction ˆY cali, adapted
+t∗+k that
+reflects distribution shifts as the following:
+ˆY adjust
+t∗+k, i =
+( ˆY cali
+t∗+k, i if i ≤ (t∗ + pt∗ )
+ˆY cali, adapted
+t∗+k, i if i > (t∗ + pt∗ ). (7)
+ˆY cali, adapted
+t∗+k, i denotes the adapted prediction values for the
+time step i of ˆY cali
+t∗+k. We summarize the overall pipeline of
+TAFAS in Appendix.
+17871
+
+Transformer
+-based Linear-based MLP-based
+Models iT
+ransformer PatchTST DLinear OLS FreTS MICN
++ TAFAS ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓
+ETTh1
+96 0.444 0.438 0.436 0.429 0.451 0.442 0.451 0.441 0.441 0.437 0.455 0.446
+192
+0.503 0.492 0.492 0.481 0.504 0.493 0.504 0.494 0.498 0.491 0.513 0.501
+336 0.562 0.554 0.539 0.529 0.551 0.541 0.551 0.540 0.563 0.555 0.574 0.561
+720 0.786 0.704 0.713 0.690 0.700 0.669 0.700 0.662 0.715 0.684 0.736 0.702
+ETTm1
+96 0.388 0.362 0.386 0.377 0.371 0.351 0.371 0.353 0.367 0.355 0.398 0.372
+192
+0.448 0.429 0.440 0.429 0.443 0.418 0.444 0.417 0.429 0.418 0.448 0.428
+336 0.519 0.493 0.500 0.487 0.518 0.481 0.518 0.479 0.493 0.476 0.524 0.493
+720 0.592 0.560 0.562 0.542 0.592 0.549 0.592 0.549 0.560 0.539 0.602 0.567
+ETTh2
+96 0.241 0.239 0.233 0.232 0.229 0.227 0.231 0.229 0.234 0.232 0.234 0.231
+192
+0.291 0.287 0.282 0.277 0.283 0.281 0.284 0.281 0.286 0.282 0.285 0.282
+336 0.333 0.326 0.328 0.318 0.325 0.317 0.326 0.317 0.328 0.318 0.330 0.320
+720 0.415 0.393 0.416 0.396 0.415 0.391 0.416 0.386 0.420 0.390 0.414 0.398
+ETTm2
+96 0.159 0.157 0.157 0.156 0.159 0.158 0.160 0.159 0.158 0.156 0.161 0.160
+192
+0.197 0.192 0.194 0.194 0.193 0.191 0.194 0.192 0.193 0.192 0.195 0.193
+336 0.244 0.235 0.234 0.232 0.232 0.229 0.233 0.230 0.233 0.230 0.235 0.232
+720 0.312 0.301 0.307 0.299 0.306 0.297 0.307 0.298 0.302 0.293 0.308 0.299
+Exchange
+96 0.086 0.084 0.084 0.081
+0.078 0.079 0.081 0.079 0.084 0.079 0.083 0.079
+192 0.175 0.165 0.179 0.168 0.171 0.161 0.172 0.162 0.176 0.163 0.183 0.170
+336 0.329 0.280 0.350 0.286 0.321 0.280 0.323 0.265 0.326 0.283 0.342 0.296
+720 0.844 0.773 0.845 0.844 0.837 0.711 0.836 0.583 0.840 0.772 1.276 0.942
+Illness
+24 2.119 2.124 2.078 2.078 2.642 2.631 2.509 2.506
+2.516 2.516 3.280 3.306
+36 1.989 1.988 2.095 2.095 2.501 2.450 2.435 2.384 2.441 2.441 3.503 3.524
+48 2.173 2.155 1.964 1.964 2.487 2.403 2.417 2.336 2.257 2.198 2.066 2.033
+60 1.925 1.876 1.833 1.833 2.530 2.444 2.490 2.415 2.074 2.056 1.915 1.881
+Weather
+96 0.179 0.170 0.174 0.171 0.195 0.179 0.196 0.179 0.181 0.169 0.176 0.175
+192
+0.227 0.214 0.221 0.215 0.240 0.223 0.240 0.223 0.225 0.212 0.224 0.222
+336 0.284 0.265 0.276 0.265 0.292 0.270 0.292 0.270 0.280 0.260 0.280 0.274
+720 0.360 0.343 0.352 0.334 0.364 0.345 0.364 0.343 0.356 0.336 0.350 0.349
+Table 1: Test MSE on multivariate time series forecasting datasets with and without TAFAS across various TSF architectures:
+Transformer-based (iTransformer, PatchTST), Linear-based (DLinear, OLS), and MLP-based (FreTS, MICN). +TAFAS de-
+notes whether the TAFAS framework is applied to the corresponding source forecaster. The lower MSE is marked in bold.
+Experiments
+Experimental Setup
+Datasets. We demonstrate the effectiveness of TAFAS using
+the seven widely used multivariate TSF benchmark datasets:
+ETTh1, ETTm1, ETTh2, ETTm2, Exchange, Illness, and
+Weather (Wu et al. 2021). In Appendix, we report the re-
+sults of the ADF test (Elliott, Rothenberg, and Stock 1992)
+to demonstrate that a substantial degree of non-stationarity
+exists in all these datasets.
+Time series forecasters.For the source time series forecast-
+ers, we adopt six state-of-the-art forecasters across various
+architectures: Transformer-based (iTransformer (Liu et al.
+2024a), PatchTST (Nie et al. 2023)), Linear-based (DLin-
+ear (Zeng et al. 2023), OLS (Toner and Darlow 2024)), and
+MLP-based (FreTS (Yi et al. 2024), MICN (Wang et al.
+2023)). Moreover, we verify the effectiveness of TAFAS on
+TSF foundation model (Ansari et al. 2024) pre-trained on a
+large corpus of time series data. TAFAS can be applied in
+combination with all of these forecasters regardless of the
+architecture design due to its fully model-agnostic design.
+Implementation details. Unless stated otherwise, we fol-
+low the standard protocol in TSF evaluation (Wu et al. 2023).
+We use the look-back window length L = 36 for Illness
+and L = 96 for the other datasets. For forecasting win-
+dow length H, we evaluate on 4 different lengths, H ∈
+{24, 36, 48, 60} for Illness and H ∈ {96, 192, 336, 720} for
+the other datasets. We split datasets in chronological order
+with the ratio of (0.6, 0.2, 0.2) for ETTh1, ETTm1, ETTh2,
+and ETTm2 and (0.7, 0.1, 0.2) for Exchange, Illness, and
+Weather to construct train, validation, and test sets. We re-
+peat each pre-training run over three different seeds and se-
+lect the pre-trained source forecaster with the lowest average
+validation MSE. More details on training processes are pro-
+vided in Appendix.
+TAFAS on Various TSF Architectures
+Table 1 presents the MSE of forecasting results with and
+without TAFAS across various source TSF architectures and
+multiple forecasting windows. The full results, including
+Mean Absolute Error (MAE) and standard deviations, are
+reported in Appendix due to the space limit. TAFAS con-
+sistently reduces the forecasting error at test-time, effec-
+tively handling the test-time non-stationarity of time series.
+We highlight that the effectiveness of TAFAS at mitigating
+17872
+
+Models iTransformer DLinear FreTS
+Norm. RevIN Dish-TS SAN RevIN Dish-TS SAN RevIN Dish-TS SAN
++ TAFAS ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓ ✗ ✓
+ETTh1
+96 0.444 0.437 0.457 0.441 0.451 0.439 0.451 0.444 0.452 0.439 0.438 0.433 0.448 0.436 0.440 0.421 0.438 0.434
+192
+0.503 0.490 0.507 0.499 0.511 0.497 0.504 0.497 0.507 0.488 0.489 0.480 0.511 0.491 0.494 0.472 0.485 0.478
+336 0.561 0.548 0.560 0.549 0.596 0.564 0.550 0.548 0.555 0.531 0.534 0.527 0.567 0.551 0.547 0.521 0.529 0.523
+720 0.785 0.702 0.720 0.669 0.727 0.689 0.699 0.669 0.708 0.642 0.664 0.652 0.729 0.682 0.706 0.641 0.665 0.640
+ETTm1
+96 0.754 0.652 0.418 0.367 0.360 0.351 0.371 0.354 0.371 0.350 0.353 0.345 1.071 0.360 0.375 0.354 0.355 0.347
+192
+0.817 0.791 0.487 0.430 0.418 0.408 0.445 0.422 0.445 0.416 0.415 0.405 0.893 0.421 0.447 0.418 0.415 0.405
+336 0.870 0.833 0.543 0.493 0.480 0.463 0.520 0.484 0.520 0.477 0.474 0.460 0.556 0.478 0.522 0.478 0.472 0.460
+720 0.940 0.897 0.606 0.554 0.530 0.517 0.593 0.553 0.597 0.539 0.526 0.514 0.599 0.535 0.598 0.541 0.525 0.512
+ETTh2
+96 0.241 0.240 0.263 0.259 0.243 0.242 0.230 0.228 0.232 0.231 0.228 0.228 0.244 0.241 0.247 0.246 0.239 0.239
+192
+0.295 0.292 0.308 0.335 0.303 0.300 0.284 0.279 0.286 0.276 0.277 0.276 0.290 0.283 0.304 0.288 0.282 0.281
+336 0.333 0.325 0.354 0.367 0.336 0.328 0.325 0.314 0.328 0.298 0.308 0.305 0.333 0.318 0.336 0.303 0.307 0.305
+720 0.415 0.392 0.469 0.424 0.434 0.405 0.409 0.383 0.424 0.358 0.381 0.364 0.422 0.384 0.435 0.366 0.368 0.356
+ETTm2
+96 0.179 0.178 0.165 0.162 0.156 0.156 0.160 0.159 0.160 0.159 0.161 0.155 0.173 0.154 0.159 0.158 0.161 0.155
+192
+0.204 0.202 0.196 0.201 0.190 0.189 0.193 0.192 0.195 0.193 0.197 0.190 0.210 0.189 0.193 0.196 0.201 0.192
+336 0.245 0.242 0.258 0.257 0.228 0.225 0.232 0.232 0.234 0.233 0.237 0.229 0.247 0.228 0.235 0.241 0.238 0.230
+720 0.316 0.309 0.315 0.328 0.299 0.292 0.306 0.301 0.306 0.298 0.296 0.291 0.306 0.297 0.312 0.308 0.297 0.289
+Exchange
+96 0.086 0.084
+0.091 0.119 0.079 0.078 0.081 0.078 0.081 0.076 0.079 0.078 0.084 0.079 0.084 0.080 0.079 0.078
+192 0.175 0.164 0.199 0.310 0.161 0.155 0.169 0.164 0.167 0.149 0.163 0.158 0.177 0.164 0.187 0.162 0.161 0.158
+336 0.329 0.282 0.366 0.546 0.307 0.275 0.317 0.293 0.307 0.254 0.300 0.275 0.328 0.302 0.336 0.295 0.298 0.276
+720 0.844 0.557 0.919 1.529 1.110 0.645 0.834 0.815 0.929 0.546 0.845 0.802 0.837 0.738 0.812 0.675 0.846 0.704
+Illness
+24 2.118 2.121 2.765 2.571
+2.587 2.589 2.654 2.613 2.778 2.865 2.460 2.423 2.480 2.438 2.577 2.542 2.536 2.500
+36 1.989 1.984 2.701 2.494 2.492 2.465 2.503 2.441 2.606 2.702 2.513 2.472 2.420 2.386 2.530 2.661 2.477 2.431
+48 2.183 2.132 2.527 2.409 2.386 2.292 2.487 2.406 2.525 2.702 2.443 2.392 2.247 2.153 2.246 2.434 2.416 2.340
+60 2.030 2.029 3.372 2.738 2.363 2.298 2.529 2.452 2.549 2.785 2.423 2.383 2.081 1.997 2.068 2.453 2.408 2.354
+Weather
+96 0.205 0.199 0.183 0.164 0.168 0.163 0.198 0.184 0.195 0.178 0.171 0.165 0.195 0.165 0.193 0.166 0.169 0.164
+192
+0.256 0.246 0.231 0.209 0.213 0.203 0.243 0.225 0.240 0.219 0.214 0.207 0.251 0.204 0.240 0.206 0.212 0.204
+336 0.306 0.286 0.286 0.257 0.266 0.253 0.295 0.269 0.292 0.267 0.269 0.258 0.304 0.253 0.293 0.253 0.266 0.256
+720 0.376 0.356 0.364 0.326 0.340 0.325 0.367 0.342 0.366 0.337 0.342 0.335 0.379 0.331 0.367 0.321 0.338 0.328
+Table 2: Compatability of TAFAS with various normalization modules addressing non-stationarity in the pre-training stage. We
+report test MSE with and without TAFAS where each source forecaster (iTransformer, DLinear, and FreTS) is pre-trained with
+the normalization modules of RevIN, Dish-TS, or SAN.
+test-time distribution shifts remains strong across various ar-
+chitectures and datasets, consolidating its broad model- and
+data-agnostic applicability. Furthermore, when H = 336 ,
+TAFAS improves the average MSE of iTransformer and
+DLinear by 4.95% and 5.20%, respectively, and on an even
+longer forecasting window (H = 720 ), the performance
+improvement brought upon by TAFAS reaches 5.76% and
+6.30%. These results indicate that TAFAS is particularly ad-
+vantageous in long-term forecasting scenarios with more se-
+vere distribution shifts.
+To further demonstrate the effectiveness of TAFAS at
+mitigating extreme test-time distribution shifts in long-term
+forecasting scenarios, we verify TAFAS under the forecast-
+ing lengths of H ∈ {780, 840, 900} on DLinear. In Ap-
+pendix, we plot the percentage of improvement in MSE
+achieved by TAFAS. Applying TAFAS exhibits a notice-
+able jump in performance improvement when compared to
+H = 336; we note that on the ETTh2 dataset, the degree of
+improvement increases by more than 8%.
+Compatibility with Methods Addressing
+Non-stationarity in Pre-training Time
+One of the mainstream approaches to mitigating non-
+stationarity in TSF is to employ normalization and denor-
+malization modules (Kim et al. 2021; Fan et al. 2023; Liu
+et al. 2024b). However, they address non-stationarity only
+in the pre-training stage using training distributions, and
+thus, they may not generalize to consistently changing test
+distributions. As TAFAS is pluggable to any source fore-
+casters in test-time, this compatibility can further enhance
+the robustness of source forecasters pre-trained with these
+widely adopted normalization modules. Table 2 presents the
+results of applying TAFAS on source forecasters equipped
+with RevIN (Kim et al. 2021), Dish-TS (Fan et al. 2023),
+or SAN (Liu et al. 2024b). Across all datasets and architec-
+tures, TAFAS further improves the forecasting capability of
+these advanced source forecasters. The strength of TAFAS
+in long-range time series forecasting is again demonstrated
+here. For iTransformer with H = 720, TAFAS reduces the
+MSE of RevIN and SAN by 8.90% and 9.39% on average.
+Likewise, for DLinear with H = 720 , TAFAS improves
+RevIN and SAN by 4.45% and 2.72% on average.
+Interestingly, the normalization approaches significantly
+increase the test MSE of the source forecaster in some exper-
+imental settings, e.g., from 0.367 to 1.071 in FreTS + RevIN
+on ETTm1 with H = 96. This observation highlights that
+addressing non-stationarity only in the pre-training phase
+can fail to generalize on the changing test distributions. In
+the above-mentioned setting, TAFAS improves the perfor-
+mance of FreTS + RevIN by 66.39%, indicating that it can
+17873
+
+Models TAFAS ETTh1 ETTm1 ETTh2 ETTm2
+Chronos-small ✗ 0.795 1.317 0.904 0.609
+✓ 0.624 0.858 0.611 0.492
+Chronos-base ✗ 0.770 1.385 1.357 0.934
+✓ 0.611 0.761 0.708 0.668
+Chronos-large ✗ 0.838 1.397 0.485 0.459
+✓ 0.635 0.772 0.477 0.431
+Table 3: Test MSE with and without TAFAS on Chronos, a
+foundation model pre-trained on a massive corpus of time
+series data. We report test MSE for H = 96.
+ETTh1 ETTm1 ETTh2 ETTm2 Exchange
+FSNet 0.615 1.641 0.788 0.431 1.464
+OneNet 0.620 1.593 0.543 0.410 0.977
+TAFAS 0.640 0.512 0.356 0.289 0.704
+Table 4: Comparison of test MSE with the state-of-the-art
+online TSF methods: FSNet and OneNet for H = 720.
+overcome this limitation of pre-training-based approaches.
+Unleashing the Knowledge of Foundation Models
+Recently, TSF foundation models pre-trained on up to bil-
+lions of time steps (Garza and Mergenthaler-Canseco 2023;
+Das et al. 2024; Ansari et al. 2024; Goswami et al. 2024)
+have shown promising forecasting performance. Here, we
+demonstrate that TAFAS can further improve the perfor-
+mance of such a powerful source forecaster. According
+to Table 3, TAFAS significantly improves the test MSE of
+Chronos (Ansari et al. 2024) on ETT datasets by up to 45%.
+The performance improvement is observed consistently on
+varying model sizes: small, base, and large. We highlight
+that ETT datasets were not included in pre-training data,
+demonstrating that TAFAS effectively adapts TSF founda-
+tion models to unseen time series data streams. The com-
+patibility of TAFAS with foundation models alludes that it
+can adapt their predictions effectively without overwriting
+the rich semantic information encoded in these models.
+Comparison with Online TSF Methods
+As mentioned in Related Works, online TSF is another line
+of research that leverages sequentially arriving data to up-
+date forecasters, but it differs from of TSF-TTA in that on-
+line TSF trains forecasters from scratch, whereas TSF-TTA
+adapts a pre-trained source forecaster. Here, we compare
+TAFAS with online TSF methods to corroborate that TAFAS
+has tangible advantages over online TSF. Table 4 presents
+test MSE of the state-of-the-art online TSF methods: FS-
+Net (Pham et al. 2023) and OneNet (Wen et al. 2024), in
+the long-term forecasting scenario of H = 720 . In most
+experimental settings, TAFAS significantly outperforms on-
+line TSF methods. The empirical superiority of TAFAS to
+online TSF can be attributed to the following factors: 1)
+proactive adaptation of forecaster using periodicity-aware
+POGT, 2) the timely adjustment of predictions to reflect ad-
+jacent distribution shifts, and 3) preservation of the knowl-
+edge in the source forecaster through the use of auxiliary
+non-stationarity-aware GCM modules.
+MSE ETTh1_96 ETTh1_192 ETTh1_336 ETTh1_720
+Batch size determined by POGT
+4 8 16 32 64 96
+0.442
+0.454
+0.446
+0.450
+Fixed POGT Length PAAS
+0.5125
+0.4975
+0.4925
+0.5075
+0.5025
+4 8 16 32 64 96
+0.57
+0.54
+0.55
+0.56
+4 8 16 32 64 96
+0.71
+0.67
+0.70
+0.69
+0.68
+4 8 16 32 64
+96
+Figure 3: Comparison of PAAS against using a fixed POGT
+length on the ETTh1 dataset.
+Modules to Adapt ETTh1 ETTh2
+MSE MAE MSE MAE
+None (baseline) 0.786 0.657 0.415 0.441
+Norm. 0.776 0.657 0.409 0.436
+Encoder 0.840 0.678 0.414 0.438
+Decoder 0.808 0.664 0.410 0.436
+All 0.832 0.673 0.414 0.438
+GCM (TAFAS) 0.704 0.627 0.393 0.425
+Table 5: Forecasting errors as different modules are adapted
+in iTransformer. “Norm.” denotes the layer normalization.
+Analysis of Each Technical Component in TAFAS
+We explore alternative design choices for two main techni-
+cal components in TAFAS. First, we study the effect of re-
+placing PAAS with a fixed POGT length. Even though ex-
+periments are conducted with DLinear on all seven datasets,
+due to the page limit, Figure 3 only shows the results on
+the ETTh1 dataset. Extended results and the range of POGT
+lengths computed by PAAS are in Appendix. Figure 3 shows
+that too short or long POGT curtails the effect of TAFAS,
+supporting the motivation behind dynamically adjusting its
+length. Second, we demonstrate the effectiveness of intro-
+ducing GCM. Table 5 presents forecasting errors for iTrans-
+former with H = 720 when other modules inside iTrans-
+former are adapted. Modifying internal modules results in
+reduced performance improvement. In some cases, the fore-
+casting performance drops below the baseline, likely due to
+the overwriting of core semantics in the source forecaster.
+The effectiveness of each component in TAFAS is shown
+through ablation studies in Appendix. Lastly, to validate
+that TAFAS can be deployed at test-time without signifi-
+cant hyper-parameter tuning, we demonstrate its robustness
+to changes in hyper-parameters in Appendix.
+Conclusion
+To address the ever-changing distributions in non-stationary
+time series, we propose TAFAS, a pioneering TSF-TTA
+framework that dynamically adapts the source forecaster
+at test-time while preserving the knowledge of the source
+forecaster. Using PAAS, the partially-observed ground truth
+with semantically meaningful patterns is acquired for proac-
+tive adaptation. Then GCM, which considers both local
+and global temporal distribution shifts is adapted to ad-
+dress changing distributions. TAFAS serves as a dataset- and
+model-agnostic framework, demonstrated by thorough ex-
+perimental results and analyses. The TSF-TTA framework
+pioneered in our work paves a new avenue toward sustain-
+able deployment of state-of-the-art time series forecasters.
+17874
+
+Acknowledgments
+This work was supported by Institute of Information &
+communications Technology Planning & Evaluation (IITP)
+grant funded by the Korea government (MSIT) [No.RS-
+2021-II211343, Artificial Intelligence Graduate School
+Program (Seoul National University)], the National Re-
+search Foundation of Korea (NRF) grant funded by
+the Korea government (MSIT) (No. 2022R1A3B1077720,
+2022R1A5A708390811), the BK21 FOUR program of the
+Education and the Research Program for Future ICT Pio-
+neers, Seoul National University in 2024, Hyundai Motor
+Company, and Samsung Electronics Co., Ltd (IO240124-
+08661-01).
+References
+Ansari, A. F.; Stella, L.; Turkmen, C.; Zhang, X.; Mercado,
+P.; Shen, H.; Shchur, O.; Rangapuram, S. S.; Arango, S. P.;
+Kapoor, S.; et al. 2024. Chronos: Learning the language of
+time series. arXiv preprint arXiv:2403.07815.
+Ao, S.-I.; and Fayek, H. 2023. Continual Deep Learning for
+Time Series Modeling. Sensors, 23(16): 7167.
+Das, A.; Kong, W.; Sen, R.; and Zhou, Y . 2024. A decoder-
+only foundation model for time-series forecasting. In Forty-
+first International Conference on Machine Learning.
+Elliott, G.; Rothenberg, T. J.; and Stock, J. H. 1992. Efficient
+tests for an autoregressive unit root.
+Fan, W.; Wang, P.; Wang, D.; Wang, D.; Zhou, Y .; and Fu, Y .
+2023. Dish-ts: a general paradigm for alleviating distribution
+shift in time series forecasting. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 37(6), 7522–
+7529.
+Garza, A.; and Mergenthaler-Canseco, M. 2023. TimeGPT-
+1. arXiv preprint arXiv:2310.03589.
+Goswami, M.; Szafer, K.; Choudhry, A.; Cai, Y .; Li, S.; and
+Dubrawski, A. 2024. MOMENT: A Family of Open Time-
+series Foundation Models. In International Conference on
+Machine Learning.
+Guo, T.; Xu, Z.; Yao, X.; Chen, H.; Aberer, K.; and Funaya,
+K. 2016. Robust online time series prediction with recur-
+rent neural networks. In2016 IEEE international conference
+on data science and advanced analytics (DSAA), 816–825.
+Ieee.
+Hosseinnia Shavaki, F.; and Ebrahimi Ghahnavieh, A. 2023.
+Applications of deep learning into supply chain manage-
+ment: a systematic literature review and a framework for
+future research. Artificial Intelligence Review, 56(5): 4447–
+4489.
+Ioffe, S.; and Szegedy, C. 2015. Batch normalization: Accel-
+erating deep network training by reducing internal covariate
+shift. In International conference on machine learning, 448–
+456. pmlr.
+Kim, T.; Kim, J.; Tae, Y .; Park, C.; Choi, J.-H.; and Choo, J.
+2021. Reversible instance normalization for accurate time-
+series forecasting against distribution shift. In International
+Conference on Learning Representations.
+Kuznetsov, V .; and Mohri, M. 2014. Generalization bounds
+for time series prediction with non-stationary processes. In
+Algorithmic Learning Theory: 25th International Confer-
+ence, ALT 2014, Bled, Slovenia, October 8-10, 2014. Pro-
+ceedings 25, 260–274. Springer.
+Lee, J.; Jung, D.; Lee, S.; Park, J.; Shin, J.; Hwang, U.; and
+Yoon, S. 2024. Entropy is not Enough for Test-Time Adapta-
+tion: From the Perspective of Disentangled Factors. In The
+Twelfth International Conference on Learning Representa-
+tions.
+Li, M.; Zhu, Y .; Shen, Y .; and Angelova, M. 2023.
+Clustering-enhanced stock price prediction using deep
+learning. World wide web, 26(1): 207–232.
+Liu, H.; Dong, Z.; Jiang, R.; Deng, J.; Deng, J.; Chen, Q.;
+and Song, X. 2023. Spatio-temporal adaptive embedding
+makes vanilla transformer sota for traffic forecasting. In
+Proceedings of the 32nd ACM international conference on
+information and knowledge management, 4125–4129.
+Liu, Y .; Hu, T.; Zhang, H.; Wu, H.; Wang, S.; Ma, L.; and
+Long, M. 2024a. iTransformer: Inverted Transformers Are
+Effective for Time Series Forecasting. In The Twelfth Inter-
+national Conference on Learning Representations.
+Liu, Y .; Wu, H.; Wang, J.; and Long, M. 2022. Non-
+stationary Transformers: Rethinking the Stationarity in Time
+Series Forecasting. NeurIPS.
+Liu, Z.; Cheng, M.; Li, Z.; Huang, Z.; Liu, Q.; Xie, Y .; and
+Chen, E. 2024b. Adaptive normalization for non-stationary
+time series forecasting: A temporal slice perspective. Ad-
+vances in Neural Information Processing Systems, 36.
+Nie, Y .; Nguyen, N. H.; Sinthong, P.; and Kalagnanam, J.
+2023. A Time Series is Worth 64 Words: Long-term Fore-
+casting with Transformers. In The Eleventh International
+Conference on Learning Representations.
+Niu, S.; Wu, J.; Zhang, Y .; Chen, Y .; Zheng, S.; Zhao, P.;
+and Tan, M. 2022. Efficient Test-Time Model Adaptation
+without Forgetting. In Chaudhuri, K.; Jegelka, S.; Song, L.;
+Szepesvari, C.; Niu, G.; and Sabato, S., eds., Proceedings
+of the 39th International Conference on Machine Learning,
+volume 162 of Proceedings of Machine Learning Research,
+16888–16905. PMLR.
+Niu, S.; Wu, J.; Zhang, Y .; Wen, Z.; Chen, Y .; Zhao, P.; and
+Tan, M. 2023. Towards Stable Test-time Adaptation in Dy-
+namic Wild World. In The Eleventh International Confer-
+ence on Learning Representations.
+Petropoulos, F.; Apiletti, D.; Assimakopoulos, V .; Babai,
+M. Z.; Barrow, D. K.; Taieb, S. B.; Bergmeir, C.; Bessa,
+R. J.; Bijak, J.; Boylan, J. E.; et al. 2022. Forecasting: theory
+and practice. International Journal of Forecasting, 38(3):
+705–871.
+Pham, Q.; Liu, C.; Sahoo, D.; and Hoi, S. 2023. Learning
+Fast and Slow for Online Time Series Forecasting. In The
+Eleventh International Conference on Learning Representa-
+tions.
+Toner, W.; and Darlow, L. N. 2024. An Analysis of Linear
+Time Series Forecasting Models. In Forty-first International
+Conference on Machine Learning.
+17875
+
+Verma, Y .; Heinonen, M.; and Garg, V . 2024. ClimODE:
+Climate and Weather Forecasting with Physics-informed
+Neural ODEs. In The Twelfth International Conference on
+Learning Representations.
+Wang, D.; Shelhamer, E.; Liu, S.; Olshausen, B.; and Dar-
+rell, T. 2021. Tent: Fully Test-Time Adaptation by Entropy
+Minimization. In International Conference on Learning
+Representations.
+Wang, H.; Peng, J.; Huang, F.; Wang, J.; Chen, J.; and Xiao,
+Y . 2023. Micn: Multi-scale local and global context model-
+ing for long-term series forecasting. In The eleventh inter-
+national conference on learning representations.
+Wen, Q.; Chen, W.; Sun, L.; Zhang, Z.; Wang, L.; Jin, R.;
+Tan, T.; et al. 2024. Onenet: Enhancing time series fore-
+casting models under concept drift by online ensembling.
+Advances in Neural Information Processing Systems, 36.
+Wu, H.; Hu, T.; Liu, Y .; Zhou, H.; Wang, J.; and Long, M.
+2023. TimesNet: Temporal 2D-Variation Modeling for Gen-
+eral Time Series Analysis. ICLR.
+Wu, H.; Xu, J.; Wang, J.; and Long, M. 2021. Autoformer:
+Decomposition transformers with auto-correlation for long-
+term series forecasting. Advances in neural information pro-
+cessing systems, 34: 22419–22430.
+Yi, K.; Zhang, Q.; Fan, W.; Wang, S.; Wang, P.; He, H.; An,
+N.; Lian, D.; Cao, L.; and Niu, Z. 2024. Frequency-domain
+MLPs are more effective learners in time series forecasting.
+Advances in Neural Information Processing Systems, 36.
+Zeng, A.; Chen, M.; Zhang, L.; and Xu, Q. 2023. Are trans-
+formers effective for time series forecasting? In Proceed-
+ings of the AAAI conference on artificial intelligence, vol-
+ume 37(9), 11121–11128.
+17876

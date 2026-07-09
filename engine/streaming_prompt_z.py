@@ -156,14 +156,24 @@ def run_prompt_z_streaming(
                     diag_accum[k].append(diagnostics[k])
 
         # ==============================================================
-        # STEP 4 — Residual Tracker Update (causal: label just arrived)
+        # STEP 4 — Capture causal stats BEFORE residual update
+        # ==============================================================
+        if mode == 'mode1' and t >= train_size and calib_optimizer is not None:
+            # Snapshot stats using only information available BEFORE Y_arrived
+            calib_stats = model.residual_tracker.get_stats()
+            calib_stats_tensor = model._pack_stats(calib_stats, device)
+        else:
+            calib_stats_tensor = None
+
+        # ==============================================================
+        # STEP 5 — Residual Tracker Update (causal: label just arrived)
         # ==============================================================
         model.residual_tracker.update(Y_hat_cached, Y_arrived)
 
         # ==============================================================
-        # STEP 5 — Mode 1: Calibrate gamma bias
+        # STEP 6 — Mode 1: Calibrate gamma bias (using pre-update stats)
         # ==============================================================
-        if mode == 'mode1' and t >= train_size and calib_optimizer is not None:
+        if calib_stats_tensor is not None:
             X_cached_dev = X_cached.to(device, non_blocking=True)
 
             # Enable grad only for gate params
@@ -180,9 +190,7 @@ def run_prompt_z_streaming(
             means_c = means_c.detach()
             stdev_c = stdev_c.detach()
 
-            stats = model.residual_tracker.get_stats()
-            stats_tensor = model._pack_stats(stats, device)
-            hidden_mod, _, _ = model.prompt_z(hidden_c, stats_tensor)
+            hidden_mod, _, _ = model.prompt_z(hidden_c, calib_stats_tensor)
             Y_hat_calib = model.backbone_adapter.decode_from_hook(hidden_mod, means_c, stdev_c)
 
             calib_loss = nn.functional.mse_loss(Y_hat_calib, Y_arrived)
@@ -379,10 +387,17 @@ def run_prompt_z_validation_fallback(
                     if k in diagnostics:
                         diag_accum[k].append(diagnostics[k])
 
+        # Capture causal stats BEFORE residual update (avoids info leak in mode1)
+        if mode == 'mode1' and t >= train_size and calib_optimizer is not None:
+            _fb_calib_stats = model.residual_tracker.get_stats()
+            _fb_calib_stats_tensor = model._pack_stats(_fb_calib_stats, device)
+        else:
+            _fb_calib_stats_tensor = None
+
         # Keep Prompt-Z raw tracker causal and comparable to normal mode0/mode1.
         model.residual_tracker.update(Y_promptz_cached, Y_arrived)
 
-        if mode == 'mode1' and t >= train_size and calib_optimizer is not None:
+        if _fb_calib_stats_tensor is not None:
             X_cached_dev = X_cached.to(device, non_blocking=True)
 
             for p in model.prompt_z.parameters():
@@ -398,9 +413,7 @@ def run_prompt_z_validation_fallback(
             means_c = means_c.detach()
             stdev_c = stdev_c.detach()
 
-            stats = model.residual_tracker.get_stats()
-            stats_tensor = model._pack_stats(stats, device)
-            hidden_mod, _, _ = model.prompt_z(hidden_c, stats_tensor)
+            hidden_mod, _, _ = model.prompt_z(hidden_c, _fb_calib_stats_tensor)
             Y_hat_calib = model.backbone_adapter.decode_from_hook(hidden_mod, means_c, stdev_c)
 
             calib_loss = nn.functional.mse_loss(Y_hat_calib, Y_arrived)

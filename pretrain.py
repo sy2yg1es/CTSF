@@ -15,13 +15,14 @@ def main(args):
     print(f"[*] Pre-training on device: {device}")
 
     # 1. 加载全量数据
+    args.val_ratio = getattr(args, 'val_ratio', 0.1)   # ensure val_ratio is set
     dataset, _ = data_provider(args)
     actual_features = dataset.data_x.shape[1]
     args.enc_in = actual_features
 
-    # Pretrain uses the earliest windows only; default is 60%.
-    train_ratio = max(0.0, min(1.0, args.train_ratio))
-    train_size = int(len(dataset) * train_ratio)
+    # Pretrain uses the earliest windows only (label fully in train zone).
+    # Use label-timestamp based boundary, not window count ratio.
+    train_size = dataset.train_size
     train_size = max(1, min(train_size, len(dataset)))
     train_subset = Subset(dataset, range(train_size))
 

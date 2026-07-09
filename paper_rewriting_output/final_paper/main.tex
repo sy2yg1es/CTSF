@@ -1,0 +1,125 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[numbers,sort]{natbib}
+\usepackage[hidelinks]{hyperref}
+
+\title{CTSF: Conservative Test-Time Stable Forecasting via Residual-Conditioned Z-Space Corrections}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Online time series forecasters operate under two pressures that are easy to conflate: the data distribution changes, and feedback for a multi-step prediction arrives only after the forecast horizon. CTSF starts from a conservative hypothesis: many shifts first appear as local displacement in a frozen backbone's hidden representation, rather than as complete failure of the backbone's temporal knowledge. The method keeps the backbone fixed and uses delayed residual histories to condition a low-rank, gated, sparse, near-identity correction in Z-space. When residual evidence is weak, the correction path is initialized and regularized to remain a no-op. This draft develops the method, its leak-free online protocol, and the planned evaluation scaffold; quantitative experiment cells are left unfilled for the final run.
+\end{abstract}
+
+\section{Introduction}
+Online forecasting is not ordinary fine-tuning with a smaller batch. At time $t$, a model can observe a look-back window and emit a horizon-$H$ forecast, but the full residual for that forecast is not known until $t+H$. Recent online time series work has shown that ignoring this delay can create information leakage or make an update chase a concept that is already outdated by the current test sample \cite{lau2025dsof,zhao2025proceed}. A useful online adaptation method must therefore answer two questions together: what evidence is causally available, and where should that evidence act?
+
+Most existing answers choose an update locus first. Some methods update weights, ensembles, adapters, or prediction layers \cite{pham2023fsnet,wen2023onenet,chen2024solid,lau2025dsof,zhao2025proceed}. Others normalize inputs or calibrate forecasts to reduce non-stationarity \cite{kim2022revin,fan2023dishts,liu2023san,dai2024ddn,ye2024fan}. Recent test-time adaptation methods keep a source forecaster frozen while updating lightweight modules with delayed or partial feedback \cite{kim2025tafas,medeiros2025petsa,lee2025elf}. ADAPT-Z sharpens the alternative view that distribution shift may be better addressed in a feature or Z-space tied to latent factors \cite{huang2026adaptz}.
+
+CTSF follows the feature-space view but adds a conservation constraint. The premise is not that the backbone has forgotten how to forecast. Instead, the hidden state for some channels may have moved away from the region where the frozen prediction head is calibrated. A delayed residual history can indicate the timing, direction, and reliability of this displacement, but it is also noisy and late. CTSF therefore treats adaptation as an exception. If residual evidence does not support a correction, the method should behave like the frozen backbone.
+
+The resulting method applies a local Z-space correction of the form
+$z'_t = z_t + \Delta z_t$, where $\Delta z_t$ is low-rank, residual-conditioned, gated, sparse across channels, and norm-bounded relative to $z_t$. The gate and mask are biased toward closure at initialization, the low-rank up projection starts at zero, and a validation fallback can select the frozen forecast when online evidence is not beneficial. These choices make the no-op path part of the design rather than a post-hoc safeguard.
+
+This draft contributes:
+\begin{itemize}
+    \item a conservative formulation of online representation correction for time series forecasting, in which delayed residuals condition bounded Z-space changes while the backbone remains frozen;
+    \item a causal residual-state interface that summarizes error magnitude, trend, volatility, signed bias, and update gap per channel;
+    \item a low-rank gated correction module with near-identity initialization, channel sparsity, perturbation clamping, and no-op regularization;
+    \item a leak-free experimental protocol with result tables reserved for the final benchmark and ablation runs.
+\end{itemize}
+
+\section{Related Work}
+\paragraph{Non-stationary forecasting.}
+Distribution shift in time series has often been handled by normalization or architecture changes. RevIN removes and restores instance statistics \cite{kim2022revin}; Dish-TS, SAN, DDN, and FAN expand this line through input-output distribution modeling, temporal-slice normalization, dual-domain normalization, and frequency-aware statistics \cite{fan2023dishts,liu2023san,dai2024ddn,ye2024fan}. These methods are useful when changing statistics are the main failure mode. CTSF targets a different locus: a hidden representation produced by a frozen forecasting backbone.
+
+\paragraph{Online time series forecasting.}
+Online TSF methods adapt as a stream arrives. FSNet learns fast and slow components \cite{pham2023fsnet}; OneNet adapts through online ensembling under concept drift \cite{wen2023onenet}; DSOF redefines the online forecasting protocol to avoid leakage and combines fast and slow streams \cite{lau2025dsof}; PROCEED estimates concept drift over the temporal gap induced by horizon-delayed feedback \cite{zhao2025proceed}. CTSF adopts the delayed-feedback discipline from this line, but it avoids full or broad parameter updates by acting only at a bounded Z-space hook.
+
+\paragraph{Residual and feature-space adaptation.}
+SOLID uses residual-context dependence to detect context-driven distribution shift and adapts a prediction layer with contextually similar samples \cite{chen2024solid}. ADAPT-Z argues that distribution shift can reflect changes in latent factors and updates features in Z-space \cite{huang2026adaptz}. CTSF is closest to this residual-and-feature family, but its correction is explicitly conservative: residual evidence opens a low-rank gate, and unreliable evidence leaves the frozen hidden state unchanged.
+
+\paragraph{Test-time and lightweight adaptation.}
+TAFAS adapts frozen source forecasters with partially observed ground truth and gated calibration modules \cite{kim2025tafas}. PETSA uses low-rank adapters and dynamic gating for parameter-efficient test-time adaptation \cite{medeiros2025petsa}. ELF improves foundation-model forecasts by exploiting online feedback without updating the foundation model itself \cite{lee2025elf}. These methods motivate lightweight deployment. CTSF applies the same deployment pressure inside a hidden-state correction rather than as input, output, or ensemble calibration.
+
+\section{Problem Setup}
+Let $x_t \in \mathbb{R}^{C}$ denote a multivariate observation with $C$ channels. At online time $t$, the forecaster receives a look-back window $X_t = (x_{t-L+1}, \ldots, x_t)$ and predicts the next $H$ steps, $Y_t = (x_{t+1}, \ldots, x_{t+H})$. The full label for this prediction becomes available only after the horizon. A causal online learner at time $t$ may use residuals from predictions issued at or before $t-H$, but not from the current forecast.
+
+We decompose a pretrained backbone into an encoder and head,
+\begin{equation}
+    z_t = e_{\theta}(X_t), \qquad \hat{Y}_t = h_{\theta}(z_t),
+\end{equation}
+where all backbone parameters $\theta$ are frozen. The goal is to learn a small adaptation module $a_{\phi}$ that produces $z'_t = z_t + a_{\phi}(z_t, r_t)$ from a causal residual state $r_t$, while avoiding harmful changes when $r_t$ is absent, noisy, or uninformative.
+
+\section{CTSF Method}
+\subsection{Causal Residual State}
+For each channel $c$, CTSF stores a rolling window of residuals whose labels have arrived. The residual state is
+\begin{equation}
+    r_{t,c} =
+    [\mu_{t,c}^{|e|},\; s_{t,c}^{|e|},\; \sigma_{t,c}^{|e|},\; \mu_{t,c}^{e},\; g_t],
+\end{equation}
+where $\mu^{|e|}$ is mean absolute error, $s^{|e|}$ is an ordinary-least-squares slope over the residual window, $\sigma^{|e|}$ is error volatility, $\mu^{e}$ is signed bias, and $g_t$ is the number of steps since the last residual update. This state is channel-local. It encodes whether recent errors are large, worsening, stable enough to trust, directionally biased, and fresh.
+
+\subsection{Drift Encoding}
+The hidden summary depends on the backbone layout. For a PatchTST-style hidden tensor $z_t \in \mathbb{R}^{B \times C \times D \times P}$, CTSF concatenates the patch-axis mean, standard deviation, and last-minus-first difference. For an iTransformer-style hidden tensor $z_t \in \mathbb{R}^{B \times C \times D}$, the hidden embedding itself is used. A drift encoder maps the hidden summary and residual state into
+\begin{equation}
+    d_{t,c} = \mathrm{LN}(W_z\,q(z_{t,c}) + W_r\,r_{t,c}),
+\end{equation}
+where $q(\cdot)$ is the layout-specific summary.
+
+\subsection{Low-Rank Gated Z-Space Correction}
+CTSF produces a confidence gate, a sparse channel mask, and a low-rank correction:
+\begin{align}
+    \gamma_{t,c} &= \sigma(w_{\gamma}^{\top} d_{t,c} + b_{\gamma}),\\
+    m_{t,c} &= \sigma(w_m^{\top} d_{t,c} + b_m),\\
+    \delta z_{t,c} &= \tanh(W_s d_{t,c}) \odot U\,\phi(V z_{t,c}).
+\end{align}
+The applied correction is
+\begin{equation}
+    z'_{t,c} =
+    z_{t,c} +
+    \gamma_{t,c} m_{t,c}
+    \operatorname{Clamp}_{\rho}( \delta z_{t,c}; z_{t,c}),
+\end{equation}
+where $\operatorname{Clamp}_{\rho}$ rescales $\delta z$ so that
+$\|\delta z\|_2 / \|z\|_2 \leq \rho$. In the current implementation, $\rho=0.05$ by default.
+
+\subsection{Conservation Under Uncertainty}
+CTSF is initialized close to the frozen backbone. The gate and mask biases are negative, the low-rank up projection $U$ is zero-initialized, and the correction is bounded by the ratio clamp. Training adds regularizers for effective correction size, mask budget, and a no-op margin: if the corrected forecast is not better than the frozen forecast by a small margin, opening the gate is penalized. During streaming evaluation, a validation fallback can select the frozen output when the adapted path does not improve a held-out online segment.
+
+\section{Experimental Protocol}
+This section is a scaffold for the final experiment run.
+
+\paragraph{Datasets and horizons.}
+The repository contains ECL, Traffic, Weather, ETTh1, ETTh2, ETTm1, and ETTm2. The run scripts already support horizons $H \in \{1,24,48,96\}$ and strict 60/10/30 train-validation-test splitting.
+
+\paragraph{Backbones and baselines.}
+The planned backbone set is PatchTST and iTransformer \cite{liu2024itransformer}. Direct baselines should include the frozen backbone, random Prompt-Z/no-op initialization, CTSF mode0, CTSF mode1, and validation-selected CTSF. External comparison baselines should include FSNet, OneNet, DSOF, PROCEED, SOLID, ADAPT-Z, TAFAS, PETSA, and ELF where implementations and settings are comparable \cite{pham2023fsnet,wen2023onenet,lau2025dsof,zhao2025proceed,chen2024solid,huang2026adaptz,kim2025tafas,medeiros2025petsa,lee2025elf}.
+
+\paragraph{Metrics and diagnostics.}
+Report MSE, MAE, RMSE, percentage change versus the frozen backbone, number of calibration updates, gate statistics, mask ratio, raw correction ratio, effective correction ratio, fallback decision rate, and wall-clock or memory overhead.
+
+% Main result table intentionally left blank in this draft.
+% Insert a table with columns: dataset, horizon, frozen, random/no-op, mode0, mode1, selected, best external baseline, delta versus frozen.
+% Ablation table intentionally left blank in this draft.
+% Insert rows for residual features, gate, mask, rank, ratio clamp, no-op penalty, and validation fallback.
+% Efficiency table intentionally left blank in this draft.
+% Insert trainable parameter count, update time, memory, and throughput.
+
+\section{Discussion and Reproducibility}
+\paragraph{Limitations.}
+This draft establishes the CTSF mechanism and its evaluation plan, but it does not yet include final benchmark numbers, statistical comparisons, profiling measurements, or complete cross-backbone ablations. The strongest claims are therefore architectural and protocol-level claims. Empirical claims should be added only after the blank result tables are filled from a leak-free run.
+
+\paragraph{Reproducibility.}
+The main implementation anchors are `models/prompt_z.py`, `models/prompt_z_framework.py`, `core/residual_tracker.py`, `engine/streaming_prompt_z.py`, `train_prompt_z.py`, and `main_prompt_z.py`. The strict evaluation scripts are under `scripts/run_prompt_z_complete.sh` and the summary format is produced by `scripts/summarize_prompt_z.py`. A full submission should include anonymized code, fixed random seeds, dataset preprocessing details, final run commands, and the completed result CSV files.
+
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+\end{document}

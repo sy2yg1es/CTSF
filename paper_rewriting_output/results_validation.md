@@ -1,0 +1,8 @@
+# Results Validation
+
+| Results Unit | Contribution Claim Tested | Result/Evidence | Allowed Interpretation | Interpretation NOT Allowed |
+|---|---|---|---|---|
+| Main benchmark table | C1, C2, C3: residual-conditioned Z-space correction should improve or preserve performance under delayed online evaluation. | Result cells are intentionally empty in the LaTeX source; existing strict-split logs show that the pipeline records frozen, random/no-op, mode0, mode1, and selected fallback rows. | The draft has a complete evaluation plan and code/log evidence that the comparison can be filled. | Do not claim SOTA, universal improvement, or final accuracy until numbers are inserted and checked. |
+| No-op/fallback analysis | C3: CTSF should remain no-op when residual evidence does not justify adaptation. | The streaming engine implements validation fallback and the existing logs record `promptz_enabled` decisions. | The mechanism is implemented and should be evaluated with harm-rate and fallback-rate metrics. | Do not claim the no-op policy always prevents degradation without final tests. |
+| Ablation table | C1-C3: residual state, gate, mask, low-rank rank, ratio clamp, and no-op loss should each be tested. | Ablation table is planned but unfilled. | The manuscript maps each ablation to a contribution promise. | Do not infer which component matters most before ablation results exist. |
+| Efficiency table | C3: frozen backbone and low-rank correction should reduce update cost relative to full fine-tuning. | The implementation freezes the backbone and trains only Prompt-Z parameters; profiling table remains blank. | It is safe to claim parameter-efficient design. | Do not claim measured speedup or memory savings until profiled. |

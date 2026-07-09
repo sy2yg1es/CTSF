@@ -1,0 +1,28 @@
+{
+  "workflow": "build_from_materials",
+  "scene": "conference",
+  "tier": "pro",
+  "output_language": "en",
+  "target_name": "CTSF",
+  "materials_dir": "D:\\model\\paper_templates\\CTSF",
+  "draft_path": "D:\\model\\paper",
+  "user_motivation": "假设在线分布变化主要引起隐藏表征偏移，而非主干模型知识整体失效。项目通过历史预测残差识别漂移时间、强度和受影响通道，并在冻结主干的基础上，对Z-space表征实施低秩、门控、近恒等的局部修正；无可靠漂移时保持No-op，从而兼顾在线适应能力、预测稳定性和计算效率。",
+  "official_urls": [
+    "https://iclr.cc/"
+  ],
+  "reference_mode": "local_first",
+  "reference_paths": [
+    "D:\\model\\references"
+  ],
+  "citation_target_count": 20,
+  "special_requirements": [
+    "必须输出 final_paper/main.tex；如果本机有 LaTeX 编译器则编译 paper.pdf。",
+    "必须生成详细 writing_rationale_matrix.md，逐段解释写作逻辑。",
+    "从素材从零构筑，不把技术说明当成初稿润色。"
+  ],
+  "word_output": "none",
+  "translation_package": "none",
+  "humanize_tier": "heavy",
+  "detection_platform": "general",
+  "ui_language": "zh"
+}

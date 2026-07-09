@@ -71,6 +71,8 @@ def build_backbone_adapter(args, device):
             factor = 1
             enc_in = args.enc_in
             output_attention = False
+            embed = 'timeF'
+            freq = 'h'
 
         backbone = iTransformer(Cfg()).to(device)
         adapter = iTransformerAdapter(backbone).to(device)
@@ -152,6 +154,8 @@ def get_streaming_dataloader(args):
     dp_args.pred_len = args.forecast_H
     dp_args.target = 'OT'
     dp_args.num_workers = args.num_workers
+    dp_args.train_ratio = getattr(args, 'train_ratio', 0.6)
+    dp_args.val_ratio   = getattr(args, 'val_ratio', 0.1)
 
     dataset, dataloader = data_provider(dp_args)
     return dataset, dataloader
@@ -226,27 +230,29 @@ def main():
     dataset, base_loader = get_streaming_dataloader(args)
     streaming_loader = StreamingEnvironment(base_loader, forecast_H=args.forecast_H)
 
-    # --- Strict 60/10/30 split ---
-    N_total = len(dataset)
-    train_end = int(N_total * args.train_ratio)          # window index where train ends
-    val_end = int(N_total * (args.train_ratio + args.val_ratio))  # where val ends
-    # If user explicitly set train_size, respect it; otherwise use strict split.
+    # --- Strict split by label timestamp (from dataset) ---
+    # dataset attributes are computed from raw row boundaries, not window count
+    # ratios, so they correctly reflect physical time boundaries.
+    train_size  = dataset.train_size   # windows with label fully in train zone
+    val_start   = dataset.val_start    # first window with label starting in val
+    test_start  = dataset.test_start   # first window with label starting in test
+    N_total     = len(dataset)
+
+    # If user explicitly overrides train_size (legacy), respect it
     if args.train_size is not None:
         test_start = args.train_size
-    else:
-        test_start = val_end
-    # Validation segment = windows [train_end, val_end)
-    val_steps = val_end - train_end
+
+    # Validation segment = windows [val_start, test_start)
+    val_steps = test_start - val_start
     if args.validation_steps is not None:
         val_steps = args.validation_steps
 
-    print(f"[*] STRICT_SPLIT")
-    print(f"[*]   total_windows={N_total}")
-    print(f"[*]   train_end={train_end} ({args.train_ratio:.0%})")
-    print(f"[*]   val_range={train_end}~{val_end} ({args.val_ratio:.0%})")
-    print(f"[*]   test_start={test_start} ({test_start/N_total:.0%})")
-    print(f"[*]   scaler_fit_end=60%")
-    print(f"[*]   metric_start={test_start}")
+    print(f"[*] STRICT_SPLIT (label-timestamp based)")
+    print(f"[*]   total_windows={N_total} | raw_train_end={dataset.raw_train_end} | raw_val_end={dataset.raw_val_end}")
+    print(f"[*]   train=[0,{train_size}) — label in train raw rows")
+    print(f"[*]   val=[{val_start},{test_start}) — label in val raw rows")
+    print(f"[*]   test=[{test_start},{N_total}) — label in test raw rows")
+    print(f"[*]   val_steps={val_steps}")
     if args.pretrained_weights:
         print(f"[*]   loaded_backbone_weights={args.pretrained_weights}")
     if args.prompt_z_weights:
@@ -259,7 +265,7 @@ def main():
         results = run_prompt_z_validation_fallback(
             model=model,
             dataloader=streaming_loader,
-            train_size=train_end,
+            train_size=val_start,
             mode=args.streaming_mode,
             calibration_lr=args.calibration_lr,
             fallback_margin=args.fallback_margin,

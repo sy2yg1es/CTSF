@@ -77,6 +77,8 @@ def build_backbone(args, device):
         cfg.factor = 1
         cfg.enc_in = args.enc_in
         cfg.output_attention = False
+        cfg.embed = 'timeF'
+        cfg.freq = 'h'
         backbone = iTransformer(cfg).to(device)
         adapter = iTransformerAdapter(backbone).to(device)
     else:
@@ -132,8 +134,11 @@ def build_model(args, adapter, device):
     return model
 
 
-def get_dataloader(args, train_ratio=0.6):
-    """Get sequential dataloader (no shuffle), limited to first train_ratio of windows."""
+def get_dataloader(args, train_ratio=0.6, val_ratio=0.1):
+    """Get sequential dataloader (no shuffle), limited to train windows only.
+    Train window = window whose label falls entirely within the train raw-row zone.
+    Determined by dataset.train_size (label-timestamp boundary), not window count.
+    """
     class DPArgs:
         pass
     dp_args = DPArgs()
@@ -144,14 +149,16 @@ def get_dataloader(args, train_ratio=0.6):
     dp_args.pred_len = args.forecast_H
     dp_args.target = 'OT'
     dp_args.num_workers = args.num_workers
+    dp_args.train_ratio = train_ratio
+    dp_args.val_ratio   = val_ratio
 
     dataset, _ = data_provider(dp_args)
 
-    # 60/10/30 split: only train on the first train_ratio of windows
-    train_size = int(len(dataset) * train_ratio)
+    # Use label-timestamp boundary from dataset (strict causal)
+    train_size = dataset.train_size
     train_subset = Subset(dataset, range(train_size))
     print(f"[*] Train subset: {train_size}/{len(dataset)} windows "
-          f"(train_ratio={train_ratio})")
+          f"(label fully in train raw rows, raw_train_end={dataset.raw_train_end})")
     dataloader = DataLoader(
         train_subset,
         batch_size=getattr(dp_args, 'batch_size', 1),
@@ -444,7 +451,8 @@ def main():
     # Build
     adapter = build_backbone(args, device)
     model = build_model(args, adapter, device)
-    _, dataloader = get_dataloader(args, train_ratio=args.train_ratio)
+    _, dataloader = get_dataloader(args, train_ratio=args.train_ratio,
+                                   val_ratio=getattr(args, 'val_ratio', 0.1))
 
     # Optimizer (only PromptZ params)
     optimizer = torch.optim.AdamW(
