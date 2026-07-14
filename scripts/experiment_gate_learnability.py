@@ -11,7 +11,8 @@ The experiment never trains on validation/test labels:
      the training tail, use the structural threshold logit > 0, and report
      every contiguous validation block. Test is intentionally untouched.
 
-This is a diagnostic experiment, not the final gate training pipeline.
+The same implementation is exposed by ``train_binary_gate.py`` for formal
+Phase-2 training, keeping validation and deployment semantics identical.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from collections import deque
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
@@ -36,10 +36,14 @@ if str(_ROOT) not in sys.path:
 
 from core.residual_tracker import ResidualTracker
 from data_provider.data_loader import data_provider
+from models.binary_channel_gate import (
+    PROTOCOL_VERSION,
+    BinaryChannelGate,
+    build_causal_gate_features,
+)
 from scripts.eval_test_oracle import (
     build_backbone,
     build_prompt_z,
-    compute_oracle_supervision,
     pack_stats,
 )
 
@@ -143,9 +147,12 @@ def collect_causal_records(
     relative_advantages = []
     labels = []
     valid = []
-    true_outputs = []
-    frozen_outputs = []
-    fixed_outputs = []
+    frozen_mse_channels = []
+    fixed_mse_channels = []
+    correction_cross_channels = []
+    correction_energy_channels = []
+    continuous_mse_channels = []
+    continuous_gammas = []
 
     start, end = sample_range
     print(f"[{label}] collect [{start},{end}) ({end-start} windows)")
@@ -156,50 +163,65 @@ def collect_causal_records(
         Y_frozen, Y_fixed, drift_state = _fixed_delta_forward(
             adapter, prompt_z, X, stats
         )
-        sup = compute_oracle_supervision(
-            Y_frozen,
-            Y_fixed,
-            Y_fixed,
-            Y,
-            target_margin_pct=args.target_margin_pct,
+        residual = Y - Y_frozen
+        correction = Y_fixed - Y_frozen
+        reduce_dims = tuple(range(1, Y.dim() - 1))
+        frozen_mse_c = (Y_frozen - Y).pow(2).mean(dim=reduce_dims)
+        fixed_mse_c = (Y_fixed - Y).pow(2).mean(dim=reduce_dims)
+        correction_cross_c = (residual * correction).mean(dim=reduce_dims)
+        correction_energy_c = correction.pow(2).mean(dim=reduce_dims)
+        advantage_c = frozen_mse_c - fixed_mse_c
+        relative_advantage_c = (
+            advantage_c / frozen_mse_c.clamp(min=1e-12) * 100.0
+        )
+        target_c = (relative_advantage_c > args.target_margin_pct).to(torch.float32)
+        valid_c = relative_advantage_c.abs() >= args.target_margin_pct
+        continuous_gamma_c = (
+            correction_cross_c / correction_energy_c.clamp(min=1e-12)
+        ).clamp(0.0, 1.0)
+        continuous_mse_c = (
+            frozen_mse_c
+            - 2.0 * continuous_gamma_c * correction_cross_c
+            + continuous_gamma_c.pow(2) * correction_energy_c
         )
 
-        drift_features = drift_state.squeeze(0)
-        extra_features = []
-        if args.feature_mode in ("drift_residual", "causal_augmented"):
-            extra_features.append(stats)
-        if args.feature_mode in ("drift_output", "causal_augmented"):
-            frozen_c = Y_frozen.squeeze(0).transpose(0, 1)  # [C,H]
-            correction_c = (Y_fixed - Y_frozen).squeeze(0).transpose(0, 1)
-            frozen_rms = frozen_c.pow(2).mean(dim=-1).sqrt()
-            correction_rms = correction_c.pow(2).mean(dim=-1).sqrt()
-            output_features = torch.stack(
-                [
-                    frozen_c.mean(dim=-1),
-                    frozen_c.abs().mean(dim=-1),
-                    frozen_c.std(dim=-1, unbiased=False),
-                    correction_c.mean(dim=-1),
-                    correction_c.abs().mean(dim=-1),
-                    correction_rms,
-                    correction_rms / frozen_rms.clamp(min=1e-6),
-                ],
-                dim=-1,
-            )
-            extra_features.append(output_features)
-        if extra_features:
-            drift_features = torch.cat(
-                [drift_features, *extra_features], dim=-1
-            )
-        features.append(drift_features.cpu())
-        advantages.append(sup["advantage_channel"].squeeze(0).cpu())
-        relative_advantages.append(
-            sup["relative_advantage_channel_pct"].squeeze(0).cpu()
+        gate_features = build_causal_gate_features(
+            drift_state, stats, Y_frozen, Y_fixed, args.feature_mode
         )
-        labels.append(sup["target_gamma_channel"].squeeze(0).cpu())
-        valid.append(sup["target_valid_channel"].squeeze(0).cpu())
-        true_outputs.append(Y.squeeze(0).cpu())
-        frozen_outputs.append(Y_frozen.squeeze(0).cpu())
-        fixed_outputs.append(Y_fixed.squeeze(0).cpu())
+        feature_dim = gate_features.shape[-1]
+        packed = torch.cat(
+            [
+                gate_features.squeeze(0),
+                torch.stack(
+                    [
+                        advantage_c.squeeze(0),
+                        relative_advantage_c.squeeze(0),
+                        target_c.squeeze(0),
+                        valid_c.squeeze(0).to(torch.float32),
+                        frozen_mse_c.squeeze(0),
+                        fixed_mse_c.squeeze(0),
+                        correction_cross_c.squeeze(0),
+                        correction_energy_c.squeeze(0),
+                        continuous_mse_c.squeeze(0),
+                        continuous_gamma_c.squeeze(0),
+                    ],
+                    dim=-1,
+                ),
+            ],
+            dim=-1,
+        ).cpu()
+        features.append(packed[:, :feature_dim])
+        stats_columns = packed[:, feature_dim:]
+        advantages.append(stats_columns[:, 0])
+        relative_advantages.append(stats_columns[:, 1])
+        labels.append(stats_columns[:, 2])
+        valid.append(stats_columns[:, 3].to(torch.bool))
+        frozen_mse_channels.append(stats_columns[:, 4])
+        fixed_mse_channels.append(stats_columns[:, 5])
+        correction_cross_channels.append(stats_columns[:, 6])
+        correction_energy_channels.append(stats_columns[:, 7])
+        continuous_mse_channels.append(stats_columns[:, 8])
+        continuous_gammas.append(stats_columns[:, 9])
 
         _tracker_step(
             tracker, residual_cache, Y_frozen, Y, args.forecast_H
@@ -213,39 +235,16 @@ def collect_causal_records(
         "relative_advantage_pct": torch.stack(relative_advantages),
         "label": torch.stack(labels).to(torch.float32), # [N,C]
         "valid": torch.stack(valid).to(torch.bool),     # [N,C]
-        "true": torch.stack(true_outputs),              # [N,H,C]
-        "frozen": torch.stack(frozen_outputs),
-        "fixed": torch.stack(fixed_outputs),
+        "frozen_mse_channel": torch.stack(frozen_mse_channels),
+        "fixed_mse_channel": torch.stack(fixed_mse_channels),
+        "correction_cross_channel": torch.stack(correction_cross_channels),
+        "correction_energy_channel": torch.stack(correction_energy_channels),
+        "continuous_mse_channel": torch.stack(continuous_mse_channels),
+        "continuous_gamma_channel": torch.stack(continuous_gammas),
     }
 
 
-class GateProbe(nn.Module):
-    def __init__(self, d_drift: int, hidden: int = 0,
-                 feature_mean=None, feature_std=None):
-        super().__init__()
-        if feature_mean is None:
-            feature_mean = torch.zeros(d_drift)
-        if feature_std is None:
-            feature_std = torch.ones(d_drift)
-        self.register_buffer("feature_mean", feature_mean.to(torch.float32))
-        self.register_buffer("feature_std", feature_std.to(torch.float32))
-        if hidden > 0:
-            self.network = nn.Sequential(
-                nn.LayerNorm(d_drift),
-                nn.Linear(d_drift, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, 1),
-            )
-            nn.init.zeros_(self.network[-1].weight)
-            nn.init.zeros_(self.network[-1].bias)
-        else:
-            self.network = nn.Linear(d_drift, 1)
-            nn.init.zeros_(self.network.weight)
-            nn.init.zeros_(self.network.bias)
-
-    def forward(self, x):
-        x = (x - self.feature_mean) / self.feature_std.clamp(min=1e-6)
-        return self.network(x).squeeze(-1)
+GateProbe = BinaryChannelGate  # Backward-compatible research-script alias.
 
 
 def flatten_valid(records):
@@ -505,9 +504,19 @@ def probe_scores(model, records):
 
 
 def mse_with_gate(records, gamma):
-    gamma = gamma.to(torch.float32).unsqueeze(1)
-    pred = records["frozen"] + gamma * (records["fixed"] - records["frozen"])
-    return F.mse_loss(pred, records["true"]).item()
+    if gamma.dtype == torch.bool:
+        return torch.where(
+            gamma,
+            records["fixed_mse_channel"],
+            records["frozen_mse_channel"],
+        ).mean().item()
+    gamma = gamma.to(torch.float32)
+    mse = (
+        records["frozen_mse_channel"]
+        - 2.0 * gamma * records["correction_cross_channel"]
+        + gamma.pow(2) * records["correction_energy_channel"]
+    )
+    return mse.mean().item()
 
 
 def tune_threshold(scores, records):
@@ -545,8 +554,8 @@ def select_safe_mode(
     """
     reg_scores = probe_scores(regressor, records)
     candidates = {
-        "frozen": F.mse_loss(records["frozen"], records["true"]).item(),
-        "fixed": F.mse_loss(records["fixed"], records["true"]).item(),
+        "frozen": records["frozen_mse_channel"].mean().item(),
+        "fixed": records["fixed_mse_channel"].mean().item(),
         "learned_regressor": mse_with_gate(records, reg_scores > 0.0),
     }
     n_windows = len(records["features"])
@@ -557,9 +566,9 @@ def select_safe_mode(
         if end <= start:
             continue
         block = {key: value[start:end] for key, value in records.items()}
-        frozen_mse = F.mse_loss(block["frozen"], block["true"]).item()
+        frozen_mse = block["frozen_mse_channel"].mean().item()
         block_values = {
-            "fixed": F.mse_loss(block["fixed"], block["true"]).item(),
+            "fixed": block["fixed_mse_channel"].mean().item(),
             "learned_regressor": mse_with_gate(
                 block, probe_scores(regressor, block) > 0.0
             ),
@@ -597,8 +606,8 @@ def select_safe_mode(
 
 
 def evaluate_safe_mode(records, selected_mode, regressor):
-    frozen_mse = F.mse_loss(records["frozen"], records["true"]).item()
-    fixed_mse = F.mse_loss(records["fixed"], records["true"]).item()
+    frozen_mse = records["frozen_mse_channel"].mean().item()
+    fixed_mse = records["fixed_mse_channel"].mean().item()
     if selected_mode == "frozen":
         selected_mse = frozen_mse
     elif selected_mode == "fixed":
@@ -639,17 +648,12 @@ def evaluate_records(
     reg_valid = reg_scores.reshape(-1)[valid_flat]
     regret_valid = regret_scores.reshape(-1)[valid_flat]
 
-    sup = compute_oracle_supervision(
-        records["frozen"],
-        records["fixed"],
-        records["fixed"],
-        records["true"],
-        target_margin_pct=0.0,
-    )
-    frozen_mse = F.mse_loss(records["frozen"], records["true"]).item()
-    fixed_mse = F.mse_loss(records["fixed"], records["true"]).item()
-    binary_oracle_mse = sup["mse_oracle_channel"].item()
-    continuous_oracle_mse = sup["mse_oracle_continuous_channel"].item()
+    frozen_mse = records["frozen_mse_channel"].mean().item()
+    fixed_mse = records["fixed_mse_channel"].mean().item()
+    binary_oracle_mse = torch.minimum(
+        records["frozen_mse_channel"], records["fixed_mse_channel"]
+    ).mean().item()
+    continuous_oracle_mse = records["continuous_mse_channel"].mean().item()
     cls_mse = mse_with_gate(records, cls_scores > cls_threshold)
     cls_soft_mse = mse_with_gate(records, torch.sigmoid(cls_scores))
     reg_mse = mse_with_gate(records, reg_scores > reg_threshold)
@@ -665,7 +669,7 @@ def evaluate_records(
 
     continuous_gain = frozen_mse - continuous_oracle_mse
     binary_gain = frozen_mse - binary_oracle_mse
-    continuous_gamma = sup["oracle_gamma_continuous_channel"]
+    continuous_gamma = records["continuous_gamma_channel"]
     return {
         "n_windows": int(records["features"].shape[0]),
         "n_channels": int(records["features"].shape[1]),
@@ -725,6 +729,7 @@ def evaluate_records(
 
 def print_summary(result):
     h = result["holdout_validation"]
+    safe = result["safe_holdout_validation"]
     print("\n" + "=" * 78)
     print("Gate learnability — held-out validation")
     print("=" * 78)
@@ -742,6 +747,11 @@ def print_summary(result):
               f"vsFrozen={m['binary_improvement_vs_frozen_pct']:+.3f}% "
               f"vsFixed={m['binary_improvement_vs_fixed_pct']:+.3f}% "
               f"oracleRecovery={m['binary_oracle_recovery']*100:+.1f}%")
+    print(
+        f"safe mode={safe['selected_mode']}  MSE={safe['mse']:.6f}  "
+        f"vsFrozen={safe['improvement_vs_frozen_pct']:+.3f}%  "
+        f"vsFixed={safe['improvement_vs_fixed_pct']:+.3f}%"
+    )
     print("=" * 78)
 
 
@@ -782,16 +792,16 @@ def main():
     p.add_argument("--validation_blocks", type=int, default=4)
     p.add_argument("--safe_min_improvement_pct", type=float, default=0.2)
     p.add_argument("--safe_min_positive_block_frac", type=float, default=0.75)
-    p.add_argument("--target_margin_pct", type=float, default=0.1)
+    p.add_argument("--target_margin_pct", type=float, default=0.0)
     p.add_argument(
         "--feature_mode",
         choices=["drift", "drift_residual", "drift_output", "causal_augmented"],
-        default="drift",
+        default="causal_augmented",
     )
     p.add_argument("--probe_epochs", type=int, default=100)
     p.add_argument("--probe_lr", type=float, default=1e-3)
     p.add_argument("--probe_weight_decay", type=float, default=1e-4)
-    p.add_argument("--probe_hidden", type=int, default=0,
+    p.add_argument("--probe_hidden", type=int, default=64,
                    help="0 for linear probe; >0 for a one-hidden-layer MLP")
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--patience", type=int, default=12)
@@ -1003,8 +1013,8 @@ def main():
         ),
         "validation_blocks": block_results,
         "note": (
-            "Preliminary learnability probe. Existing P1 delta was selected on validation; "
-            "do not treat this run as an unbiased final model comparison. Test untouched."
+            "Binary gate checkpoint is selected entirely on train-tail blocks with a fixed "
+            "zero threshold. Validation is report-only and TEST remains untouched."
         ),
     }
 
@@ -1027,6 +1037,13 @@ def main():
             "regret_classifier": regret_classifier.state_dict(),
             "classifier_threshold": cls_threshold,
             "regressor_threshold": reg_threshold,
+            "decision_threshold": 0.0,
+            "selected_mode": safe_mode,
+            "protocol_version": PROTOCOL_VERSION,
+            "safety_selection": {
+                "candidate_mse": safe_selection_candidates,
+                "diagnostics": safe_selection_diagnostics,
+            },
             "config": vars(args),
         },
         model_path,

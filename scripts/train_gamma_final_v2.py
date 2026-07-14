@@ -255,7 +255,9 @@ def pack_stats(tracker, device):
 # Core forward
 # ============================================================================
 
-def pz_forward(X, adapter, prompt_z, stats_tensor, *, gamma_mode):
+def pz_forward(
+    X, adapter, prompt_z, stats_tensor, *, gamma_mode, collect_diagnostics=False
+):
     """
     gamma_mode:
       "ones"        : gamma=1，confidence_gate 脱离计算图
@@ -297,14 +299,13 @@ def pz_forward(X, adapter, prompt_z, stats_tensor, *, gamma_mode):
         drift_state = prompt_z.drift_encoder(summary, stats_tensor)
 
         if gamma_mode == "ones":
-            with torch.no_grad():
-                gamma_raw = prompt_z.confidence_gate(drift_state)
-            gamma = torch.ones_like(gamma_raw)
+            gamma = torch.ones(
+                (*drift_state.shape[:2], 1),
+                device=drift_state.device,
+                dtype=drift_state.dtype,
+            )
         else:
             gamma = prompt_z.confidence_gate(drift_state)
-
-        with torch.no_grad():
-            prompt_z.sparse_mask(drift_state)   # run but discard (mask=ones)
 
         if layout == "BCDP":
             h_w         = hidden.permute(0, 1, 3, 2)
@@ -330,38 +331,47 @@ def pz_forward(X, adapter, prompt_z, stats_tensor, *, gamma_mode):
         hidden_mod = hidden + applied
         Y_hat = adapter.decode_from_hook(hidden_mod, means, stdev)
 
-    # Diagnostics (detached)
-    with torch.no_grad():
-        df_raw  = delta_h_raw.detach().flatten(2)
-        df_clmp = delta_h_clamped.detach().flatten(2)
-        h_flat2 = hidden.flatten(2)
-        h_n     = h_flat2.norm(dim=-1).clamp(min=1e-8)
+    # Diagnostics are intentionally sampled only at summary intervals.  Each
+    # .item() synchronizes the GPU, so building them every window is expensive.
+    diag = {}
+    if collect_diagnostics:
+        with torch.no_grad():
+            df_raw = delta_h_raw.detach().flatten(2)
+            df_clmp = delta_h_clamped.detach().flatten(2)
+            h_n = hidden.flatten(2).norm(dim=-1).clamp(min=1e-8)
+            raw_norm = df_raw.norm(dim=-1)
+            clamped_norm = df_clmp.norm(dim=-1)
+            max_allowed = prompt_z.max_delta_ratio * h_n
 
-        unclamp_d2h = (df_raw.norm(dim=-1) / h_n).mean().item()
-        clamp_d2h   = (df_clmp.norm(dim=-1) / h_n).mean().item()
-        max_allowed = prompt_z.max_delta_ratio * h_n
-        at_cap = (df_raw.norm(dim=-1) > max_allowed + 1e-6).float().mean().item()
-
-        if gamma_mode != "ones_nograd":
-            g = gamma.detach()
-            gd = {
-                "gamma_mean":      g.mean().item(),
-                "gamma_std":       g.std().item(),
-                "gamma_min":       g.min().item(),
-                "gamma_max":       g.max().item(),
-                "gamma_spread":    g.std(dim=1).mean().item(),
-                "frac_gamma_lt01": (g < 0.1).float().mean().item(),
-                "frac_gamma_gt09": (g > 0.9).float().mean().item(),
-            }
-        else:
-            gd = dict(gamma_mean=1.0, gamma_std=0.0, gamma_min=1.0,
-                      gamma_max=1.0, gamma_spread=0.0,
-                      frac_gamma_lt01=0.0, frac_gamma_gt09=1.0)
-
-        diag = {**gd,
-                "unclamped_d2h": unclamp_d2h,
-                "clamped_d2h":   clamp_d2h,
-                "at_cap_frac":   at_cap}
+            if gamma_mode != "ones_nograd":
+                g = gamma.detach()
+                gate_stats = [
+                    g.mean(),
+                    g.std(),
+                    g.min(),
+                    g.max(),
+                    g.std(dim=1).mean(),
+                    (g < 0.1).float().mean(),
+                    (g > 0.9).float().mean(),
+                ]
+            else:
+                gate_stats = [hidden.new_tensor(v) for v in (1, 0, 1, 1, 0, 0, 1)]
+            values = torch.stack(
+                [
+                    *gate_stats,
+                    (raw_norm / h_n).mean(),
+                    (clamped_norm / h_n).mean(),
+                    (raw_norm > max_allowed + 1e-6).float().mean(),
+                ]
+            ).cpu().tolist()
+            diag = dict(zip(
+                [
+                    "gamma_mean", "gamma_std", "gamma_min", "gamma_max",
+                    "gamma_spread", "frac_gamma_lt01", "frac_gamma_gt09",
+                    "unclamped_d2h", "clamped_d2h", "at_cap_frac",
+                ],
+                values,
+            ))
 
     return dict(Y_hat=Y_hat, Y_frozen=Y_frozen,
                 delta_h_raw=delta_h_raw, delta_h_clamped=delta_h_clamped,
@@ -386,7 +396,8 @@ def evaluate_val_p1(adapter, prompt_z, val_loader, args, device):
     tracker = ResidualTracker(args.enc_in, args.residual_window_K).to(device)
     tracker.reset()
     rc = deque()
-    total_fixed = total_frozen = 0.0
+    total_fixed = torch.zeros((), device=device, dtype=torch.float64)
+    total_frozen = torch.zeros((), device=device, dtype=torch.float64)
     n = 0
 
     prompt_z.eval()
@@ -395,8 +406,8 @@ def evaluate_val_p1(adapter, prompt_z, val_loader, args, device):
         st  = pack_stats(tracker, device)
         out = pz_forward(X, adapter, prompt_z, st, gamma_mode="ones")
 
-        total_fixed  += F.mse_loss(out["Y_hat"],    Y).item()
-        total_frozen += F.mse_loss(out["Y_frozen"], Y).item()
+        total_fixed += F.mse_loss(out["Y_hat"], Y).to(torch.float64)
+        total_frozen += F.mse_loss(out["Y_frozen"], Y).to(torch.float64)
         n += 1
 
         rc.append((out["Y_frozen"].detach(), Y.detach()))
@@ -406,8 +417,8 @@ def evaluate_val_p1(adapter, prompt_z, val_loader, args, device):
             tracker.step_no_update()
 
     prompt_z.train()
-    af  = total_fixed  / max(n, 1)
-    afr = total_frozen / max(n, 1)
+    af = (total_fixed / max(n, 1)).item()
+    afr = (total_frozen / max(n, 1)).item()
     return {
         "val_mse_frozen":       afr,
         "val_mse_fixed_gamma1": af,
@@ -422,7 +433,9 @@ def evaluate_val_dual(adapter, prompt_z, val_loader, args, device):
     tracker = ResidualTracker(args.enc_in, args.residual_window_K).to(device)
     tracker.reset()
     rc = deque()
-    total_fixed = total_learned = total_frozen = 0.0
+    total_fixed = torch.zeros((), device=device, dtype=torch.float64)
+    total_learned = torch.zeros((), device=device, dtype=torch.float64)
+    total_frozen = torch.zeros((), device=device, dtype=torch.float64)
     n = 0
 
     prompt_z.eval()
@@ -434,9 +447,9 @@ def evaluate_val_dual(adapter, prompt_z, val_loader, args, device):
         out1 = pz_forward(X, adapter, prompt_z, st, gamma_mode="ones")
         out2 = pz_forward(X, adapter, prompt_z, st, gamma_mode="learned")
 
-        total_fixed   += F.mse_loss(out1["Y_hat"],    Y).item()
-        total_learned += F.mse_loss(out2["Y_hat"],    Y).item()
-        total_frozen  += F.mse_loss(out1["Y_frozen"], Y).item()
+        total_fixed += F.mse_loss(out1["Y_hat"], Y).to(torch.float64)
+        total_learned += F.mse_loss(out2["Y_hat"], Y).to(torch.float64)
+        total_frozen += F.mse_loss(out1["Y_frozen"], Y).to(torch.float64)
         n += 1
 
         rc.append((out1["Y_frozen"].detach(), Y.detach()))
@@ -446,9 +459,9 @@ def evaluate_val_dual(adapter, prompt_z, val_loader, args, device):
             tracker.step_no_update()
 
     prompt_z.train()
-    af = total_fixed / max(n, 1)
-    al = total_learned / max(n, 1)
-    afr = total_frozen / max(n, 1)
+    af = (total_fixed / max(n, 1)).item()
+    al = (total_learned / max(n, 1)).item()
+    afr = (total_frozen / max(n, 1)).item()
     return {
         "val_mse_frozen":        afr,
         "val_mse_fixed_gamma1":  af,
@@ -511,8 +524,12 @@ def run_phase1(adapter, prompt_z, p1_subset, val_loader,
         X = X.to(device); Y = Y.to(device)
         opt.zero_grad()
         st = pack_stats(tracker, device)
+        log_now = step % args.log_interval == 0
 
-        out = pz_forward(X, adapter, prompt_z, st, gamma_mode="ones")
+        out = pz_forward(
+            X, adapter, prompt_z, st,
+            gamma_mode="ones", collect_diagnostics=log_now,
+        )
         forecast_loss = F.mse_loss(out["Y_hat"], Y)
         exc           = excess_penalty_fn(out["unclamped_ratio_live"], args.max_delta_ratio)
         loss          = forecast_loss + args.lambda_excess * exc
@@ -520,19 +537,20 @@ def run_phase1(adapter, prompt_z, p1_subset, val_loader,
         torch.nn.utils.clip_grad_norm_(p1_params, max_norm=1.0)
         opt.step()
 
-        with torch.no_grad():
-            mse_fr = F.mse_loss(out["Y_frozen"], Y).item()
-            impr   = (mse_fr - forecast_loss.item()) / max(mse_fr, 1e-12) * 100
-            d = out["diag"]
-            row = {"phase": 1, "step": step,
-                   "forecast_loss": forecast_loss.item(), "frozen_loss": mse_fr,
-                   "improvement": impr, "excess_penalty": exc.item(), **d}
-        log_f.write(json.dumps(row) + "\n"); log_f.flush()
-
-        if step % args.log_interval == 0:
-            print(f"[P1|{step:5d}]  loss={forecast_loss.item():.6f}  "
+        if log_now:
+            with torch.no_grad():
+                mse_fr = F.mse_loss(out["Y_frozen"], Y).item()
+                train_loss = forecast_loss.item()
+                excess_value = exc.item()
+                impr = (mse_fr - train_loss) / max(mse_fr, 1e-12) * 100
+                d = out["diag"]
+                row = {"phase": 1, "step": step,
+                       "forecast_loss": train_loss, "frozen_loss": mse_fr,
+                       "improvement": impr, "excess_penalty": excess_value, **d}
+            log_f.write(json.dumps(row) + "\n")
+            print(f"[P1|{step:5d}]  loss={train_loss:.6f}  "
                   f"frozen={mse_fr:.6f}  impr={impr:+.2f}%  "
-                  f"excess={exc.item():.6f}  "
+                  f"excess={excess_value:.6f}  "
                   f"unclamp={d['unclamped_d2h']:.5f}  "
                   f"clamp={d['clamped_d2h']:.5f}  at_cap={d['at_cap_frac']:.2f}")
 
@@ -548,9 +566,15 @@ def run_phase1(adapter, prompt_z, p1_subset, val_loader,
             if vr_snap["val_mse_fixed_gamma1"] < best_val:
                 best_val = vr_snap["val_mse_fixed_gamma1"]
                 torch.save(prompt_z.state_dict(), ckpt)
+                checkpoint_update = True
+            else:
+                checkpoint_update = False
             log_f.write(json.dumps(
-                {"phase": 1, "step": step, "val_snapshot": True, **vr_snap}
-            ) + "\n"); log_f.flush()
+                {"phase": 1, "step": step, "val_snapshot": True,
+                 "best_validation_mse": best_val,
+                 "checkpoint_update": checkpoint_update, **vr_snap}
+            ) + "\n")
+            log_f.flush()
 
         with torch.no_grad():
             rc.append((out["Y_frozen"].detach(), Y.detach()))
@@ -646,25 +670,29 @@ def run_phase2(adapter, prompt_z, p1_subset, p2_subset, val_loader,
         X = X.to(device); Y = Y.to(device)
         opt.zero_grad()
         st = pack_stats(tracker, device)
+        log_now = step % args.log_interval == 0
 
-        out           = pz_forward(X, adapter, prompt_z, st, gamma_mode="learned")
+        out = pz_forward(
+            X, adapter, prompt_z, st,
+            gamma_mode="learned", collect_diagnostics=log_now,
+        )
         forecast_loss = F.mse_loss(out["Y_hat"], Y)
         # delta frozen → excess penalty 无意义，只用 forecast loss
         forecast_loss.backward()
         torch.nn.utils.clip_grad_norm_(gate_params, max_norm=1.0)
         opt.step()
 
-        with torch.no_grad():
-            mse_fr = F.mse_loss(out["Y_frozen"], Y).item()
-            impr   = (mse_fr - forecast_loss.item()) / max(mse_fr, 1e-12) * 100
-            d = out["diag"]
-            row = {"phase": 2, "step": step,
-                   "forecast_loss": forecast_loss.item(), "frozen_loss": mse_fr,
-                   "improvement": impr, **d}
-        log_f.write(json.dumps(row) + "\n"); log_f.flush()
-
-        if step % args.log_interval == 0:
-            print(f"[P2|{step:5d}]  loss={forecast_loss.item():.6f}  "
+        if log_now:
+            with torch.no_grad():
+                mse_fr = F.mse_loss(out["Y_frozen"], Y).item()
+                train_loss = forecast_loss.item()
+                impr = (mse_fr - train_loss) / max(mse_fr, 1e-12) * 100
+                d = out["diag"]
+                row = {"phase": 2, "step": step,
+                       "forecast_loss": train_loss, "frozen_loss": mse_fr,
+                       "improvement": impr, **d}
+            log_f.write(json.dumps(row) + "\n")
+            print(f"[P2|{step:5d}]  loss={train_loss:.6f}  "
                   f"frozen={mse_fr:.6f}  impr={impr:+.2f}%  "
                   f"γ={d['gamma_mean']:.4f}±{d['gamma_std']:.4f}"
                   f"[{d['gamma_min']:.3f},{d['gamma_max']:.3f}]  "
@@ -680,7 +708,8 @@ def run_phase2(adapter, prompt_z, p1_subset, p2_subset, val_loader,
                 print(f"  → val best={best_val:.6f}")
             log_f.write(json.dumps({
                 "phase": 2, "step": step, "val_snapshot": True, **vr
-            }) + "\n"); log_f.flush()
+            }) + "\n")
+            log_f.flush()
 
         with torch.no_grad():
             rc.append((out["Y_frozen"].detach(), Y.detach()))
@@ -805,6 +834,15 @@ def run(args, device):
         log_f.close()
         return
 
+    if not args.allow_legacy_continuous_phase2:
+        log_f.close()
+        raise RuntimeError(
+            "The legacy continuous confidence-gate Phase 2 is disabled by the "
+            "final protocol. Run scripts/train_binary_gate.py with this P1 "
+            "checkpoint, or pass --allow_legacy_continuous_phase2 only for "
+            "historical reproduction."
+        )
+
     # Decision
     print(f"\n{'='*70}")
     impr1 = vr1["val_impr_fixed_pct"]
@@ -829,7 +867,7 @@ def run(args, device):
 
 
 def main():
-    p = argparse.ArgumentParser("Two-Phase Delta Warmup + Gate-Only Training (v2)")
+    p = argparse.ArgumentParser("Prompt-Z Phase 1 delta training")
     p.add_argument("--root_path",   default="./data")
     p.add_argument("--data_path",   required=True)
     p.add_argument("--features",    default="M")
@@ -860,11 +898,17 @@ def main():
     p.add_argument(
         "--phase1_selection_source",
         choices=["validation", "train_tail"],
-        default="validation",
+        default="train_tail",
         help="Use train_tail for a clean delta checkpoint without validation labels",
     )
     p.add_argument("--phase1_selection_fraction", type=float, default=0.2)
     p.add_argument("--stop_after_phase1", action="store_true", default=False)
+    p.add_argument(
+        "--allow_legacy_continuous_phase2",
+        action="store_true",
+        default=False,
+        help="Historical reproduction only; formal Phase 2 uses train_binary_gate.py",
+    )
     p.add_argument("--force_phase2",  action="store_true", default=False)
     p.add_argument("--skip_phase1",   action="store_true", default=False)
     p.add_argument("--phase1_ckpt",   default=None)
@@ -917,8 +961,7 @@ def main():
 
     print(f"[*] P1: gamma=1, drift+delta, lambda_excess={args.lambda_excess}, "
           f"max_delta_ratio={args.max_delta_ratio}")
-    print(f"[*] P2: gamma=learned, gate_only, lr_gate={args.lr_gate}, "
-          f"pass_threshold={args.phase1_pass_threshold}%")
+    print("[*] P2 protocol: frozen Prompt-Z + signed-advantage binary channel gate")
 
     run(args, device)
 

@@ -35,7 +35,7 @@ def run_command(command: list[str], label: str) -> None:
 
 
 def result_path(dataset: str, horizon: int, backbone: str, seed: int) -> Path:
-    tag = "patch_cleanp1_v1" if backbone == "patchtst" else "itrans_cleanp1_v1"
+    tag = "patch_binarygate_v1" if backbone == "patchtst" else "itrans_binarygate_v1"
     return ROOT / "logs" / "prompt_z" / "gate_probe" / (
         f"gate_probe_{dataset}_H{horizon}_causal_augmented_s{seed}_{tag}.json"
     )
@@ -43,15 +43,16 @@ def result_path(dataset: str, horizon: int, backbone: str, seed: int) -> Path:
 
 def p1_path(dataset: str, horizon: int, backbone: str) -> Path:
     short = "patch" if backbone == "patchtst" else "itrans"
+    protocol_tag = "binarygate_h12_v1" if horizon == 12 else "cleanp1_v1"
     return ROOT / "weights" / "prompt_z" / (
-        f"gfv2_{dataset}_H{horizon}_{short}_cleanp1_v1_p1.pth"
+        f"gfv2_{dataset}_H{horizon}_{short}_{protocol_tag}_p1.pth"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser("Resumable multi-horizon binary-gate validation")
     parser.add_argument("--datasets", nargs="+", default=["ETTm1", "ETTm2"])
-    parser.add_argument("--horizons", nargs="+", type=int, default=[12, 24, 48])
+    parser.add_argument("--horizons", nargs="+", type=int, default=[1, 12, 24, 48])
     parser.add_argument(
         "--backbones", nargs="+", default=["patchtst", "itransformer"],
         choices=["patchtst", "itransformer"],
@@ -59,10 +60,13 @@ def main() -> None:
     parser.add_argument("--seeds", nargs="+", type=int, default=[2026])
     parser.add_argument("--root_path", default="./dataset")
     parser.add_argument("--train_steps", type=int, default=2000)
+    parser.add_argument("--h12_train_steps", type=int, default=8000)
     parser.add_argument("--val_steps", type=int, default=2000)
     parser.add_argument("--p1_steps", type=int, default=2000)
     parser.add_argument("--selection_fraction", type=float, default=0.2)
-    parser.add_argument("--manifest", default="logs/prompt_z/gate_horizon_manifest.json")
+    parser.add_argument(
+        "--manifest", default="logs/prompt_z/gate_horizon_manifest_binary_v1.json"
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -70,11 +74,14 @@ def main() -> None:
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
-        manifest = {"protocol": "clean_p1_fixed_zero_blocked_v1", "cases": {}}
+        manifest = {"protocol": "binary_channel_gate_v1", "cases": {}}
 
     for dataset in args.datasets:
         data_path = f"{dataset}.csv"
         for horizon in args.horizons:
+            gate_train_steps = (
+                args.h12_train_steps if horizon == 12 else args.train_steps
+            )
             for backbone in args.backbones:
                 case = f"{dataset}_H{horizon}_{backbone}"
                 state = manifest["cases"].setdefault(case, {})
@@ -90,6 +97,11 @@ def main() -> None:
                 clean_p1 = p1_path(dataset, horizon, backbone)
                 if args.force or not clean_p1.exists():
                     short = "patch" if backbone == "patchtst" else "itrans"
+                    p1_tag = (
+                        f"{short}_binarygate_h12_v1"
+                        if horizon == 12
+                        else f"{short}_cleanp1_v1"
+                    )
                     command = [
                         sys.executable,
                         "scripts/train_gamma_final_v2.py",
@@ -104,7 +116,7 @@ def main() -> None:
                         "--max_delta_ratio", "0.02",
                         "--residual_window_K", "24",
                         "--phase1_steps", str(args.p1_steps),
-                        "--phase2_steps", str(args.train_steps),
+                        "--phase2_steps", str(gate_train_steps),
                         "--phase1_selection_source", "train_tail",
                         "--phase1_selection_fraction", str(args.selection_fraction),
                         "--stop_after_phase1",
@@ -113,7 +125,7 @@ def main() -> None:
                         "--weight_decay", "0.0001",
                         "--lambda_excess", "1.0",
                         "--num_workers", "0",
-                        "--experiment_tag", f"{short}_cleanp1_v1",
+                        "--experiment_tag", p1_tag,
                     ]
                     state["status"] = "p1_running"
                     save_manifest(manifest_path, manifest)
@@ -131,13 +143,13 @@ def main() -> None:
                     seed_state = state.setdefault("seeds", {}).setdefault(str(seed), {})
                     if args.force or not output.exists():
                         tag = (
-                            "patch_cleanp1_v1"
+                            "patch_binarygate_v1"
                             if backbone == "patchtst"
-                            else "itrans_cleanp1_v1"
+                            else "itrans_binarygate_v1"
                         )
                         command = [
                             sys.executable,
-                            "scripts/experiment_gate_learnability.py",
+                            "scripts/train_binary_gate.py",
                             "--root_path", args.root_path,
                             "--data_path", data_path,
                             "--forecast_H", str(horizon),
@@ -148,7 +160,7 @@ def main() -> None:
                             "--rank", "8",
                             "--max_delta_ratio", "0.02",
                             "--residual_window_K", "24",
-                            "--train_steps", str(args.train_steps),
+                            "--train_steps", str(gate_train_steps),
                             "--val_steps", str(args.val_steps),
                             "--warmup_steps", "1000",
                             "--target_margin_pct", "0",
@@ -177,10 +189,11 @@ def main() -> None:
                     seed_state.update(
                         status="complete",
                         result_path=str(output),
-                        classifier_vs_fixed_pct=result["holdout_validation"]
-                        ["classifier"]["binary_improvement_vs_fixed_pct"],
-                        classifier_vs_frozen_pct=result["holdout_validation"]
-                        ["classifier"]["binary_improvement_vs_frozen_pct"],
+                        selected_mode=result["safety_selection_block"]["selected_mode"],
+                        regressor_vs_fixed_pct=result["holdout_validation"]
+                        ["regressor"]["binary_improvement_vs_fixed_pct"],
+                        regressor_vs_frozen_pct=result["holdout_validation"]
+                        ["regressor"]["binary_improvement_vs_frozen_pct"],
                     )
                     save_manifest(manifest_path, manifest)
 
