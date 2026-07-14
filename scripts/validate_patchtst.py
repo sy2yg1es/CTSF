@@ -123,19 +123,22 @@ def build_backbone(enc_in: int, forecast_H: int, device: torch.device) -> PatchT
     from models.backbones.PatchTST import Model as PatchTST
 
     class Cfg:
-        task_name  = "long_term_forecast"
-        seq_len    = SEQ_LEN
-        pred_len   = forecast_H
-        d_model    = D_MODEL
-        d_ff       = D_FF
-        n_heads    = 8
-        e_layers   = E_LAYERS
-        dropout    = 0.1
-        activation = "gelu"
-        factor     = 1
-        enc_in     = enc_in
+        pass
 
-    model   = PatchTST(Cfg()).to(device)
+    cfg = Cfg()
+    cfg.task_name  = "long_term_forecast"
+    cfg.seq_len    = SEQ_LEN
+    cfg.pred_len   = forecast_H
+    cfg.d_model    = D_MODEL
+    cfg.d_ff       = D_FF
+    cfg.n_heads    = 8
+    cfg.e_layers   = E_LAYERS
+    cfg.dropout    = 0.1
+    cfg.activation = "gelu"
+    cfg.factor     = 1
+    cfg.enc_in     = enc_in
+
+    model   = PatchTST(cfg).to(device)
     adapter = PatchTSTAdapter(model).to(device)
     return adapter
 

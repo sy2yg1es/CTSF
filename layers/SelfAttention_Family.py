@@ -3,8 +3,14 @@ import torch.nn as nn
 import numpy as np
 from math import sqrt
 from utils.masking import TriangularCausalMask, ProbMask
-from reformer_pytorch import LSHSelfAttention
-from einops import rearrange, repeat
+try:
+    from reformer_pytorch import LSHSelfAttention
+except ImportError:  # Optional: PatchTST and iTransformer do not use Reformer.
+    LSHSelfAttention = None
+try:
+    from einops import rearrange, repeat
+except ImportError:  # Optional: only TwoStageAttentionLayer needs einops.
+    rearrange = repeat = None
 
 
 class DSAttention(nn.Module):
@@ -217,6 +223,10 @@ class ReformerLayer(nn.Module):
     def __init__(self, attention, d_model, n_heads, d_keys=None,
                  d_values=None, causal=False, bucket_size=4, n_hashes=4):
         super().__init__()
+        if LSHSelfAttention is None:
+            raise ImportError(
+                "ReformerLayer requires the optional 'reformer-pytorch' package"
+            )
         self.bucket_size = bucket_size
         self.attn = LSHSelfAttention(
             dim=d_model,
@@ -252,6 +262,10 @@ class TwoStageAttentionLayer(nn.Module):
     def __init__(self, configs,
                  seg_num, factor, d_model, n_heads, d_ff=None, dropout=0.1):
         super(TwoStageAttentionLayer, self).__init__()
+        if rearrange is None:
+            raise ImportError(
+                "TwoStageAttentionLayer requires the optional 'einops' package"
+            )
         d_ff = d_ff or 4 * d_model
         self.time_attention = AttentionLayer(FullAttention(False, configs.factor, attention_dropout=configs.dropout,
                                                            output_attention=False), d_model, n_heads)

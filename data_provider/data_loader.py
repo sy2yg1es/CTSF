@@ -20,6 +20,7 @@ Dataset_Custom: 严格按时间顺序滑动的流式数据集基类。
    暴露属性：
      dataset.train_size  — 纯训练窗口数，索引范围 [0, train_size)
      dataset.val_start   — 第一个 val 窗口的索引
+     dataset.val_end     — 最后一个完全落在 val 内的窗口之后
      dataset.test_start  — 第一个 test 窗口的索引
 """
 
@@ -159,6 +160,7 @@ class Dataset_Custom(Dataset):
         # Val: label_start >= raw_train_end AND label_end <= raw_val_end
         #   → t >= raw_train_end - seq_len   (label starts in val zone)
         #   val_start = max(0, raw_train_end - seq_len)
+        #   val_end = raw_val_end - seq_len - pred_len + 1 (exclusive)
         #
         # Test: label_start >= raw_val_end
         #   → t >= raw_val_end - seq_len
@@ -168,6 +170,10 @@ class Dataset_Custom(Dataset):
 
         self.train_size  = max(0, raw_train_end - self.seq_len - self.pred_len + 1)
         self.val_start   = max(0, raw_train_end - self.seq_len)
+        self.val_end     = max(
+            self.val_start,
+            raw_val_end - self.seq_len - self.pred_len + 1,
+        )
         self.test_start  = max(0, raw_val_end   - self.seq_len)
         self.n_windows   = max(0, N - self.seq_len - self.pred_len + 1)
 
@@ -179,7 +185,8 @@ class Dataset_Custom(Dataset):
         print(
             f"[DataLoader] label-ts windows: "
             f"train=[0,{self.train_size}) | "
-            f"val=[{self.val_start},{self.test_start}) | "
+            f"val=[{self.val_start},{self.val_end}) | "
+            f"boundary_gap=[{self.val_end},{self.test_start}) | "
             f"test=[{self.test_start},{self.n_windows})"
         )
 
@@ -223,6 +230,7 @@ def data_provider(args):
     Key attributes on returned dataset:
       dataset.train_size   — number of pure-train windows (label in train zone)
       dataset.val_start    — first val window index
+      dataset.val_end      — exclusive val end (label fully inside val)
       dataset.test_start   — first test window index
     """
     train_ratio      = getattr(args, 'train_ratio', None)
@@ -254,4 +262,3 @@ def data_provider(args):
     )
 
     return dataset, dataloader
-
