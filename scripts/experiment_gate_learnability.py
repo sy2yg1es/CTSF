@@ -374,6 +374,23 @@ def train_classifier(train, calib, args, device):
     return model.cpu(), {"best_calib_loss": best_loss, "epochs": epoch + 1}
 
 
+def consume_classifier_initialization_rng(train, args, device):
+    """Preserve the deployed regressor's exact historical initialization.
+
+    The full diagnostic pipeline initialized the classifier before the
+    regressor. DataLoader shuffling uses a private generator, so constructing
+    and discarding this one model reproduces the only global RNG consumption
+    relevant to the following regressor while avoiding classifier training.
+    """
+    train_x, _, _ = flatten_valid(train)
+    feature_mean = train_x.mean(dim=0)
+    feature_std = train_x.std(dim=0, unbiased=False).clamp(min=1e-6)
+    unused = GateProbe(
+        train_x.shape[-1], args.probe_hidden, feature_mean, feature_std
+    ).to(device)
+    del unused
+
+
 def train_regressor(train, calib, args, device):
     train_x, _, train_rel = flatten_valid(train)
     calib_x, _, calib_rel = flatten_valid(calib)
@@ -639,14 +656,10 @@ def evaluate_records(
     reg_threshold,
     regret_threshold=0.0,
 ):
-    cls_scores = probe_scores(classifier, records)
     reg_scores = probe_scores(regressor, records)
-    regret_scores = probe_scores(regret_classifier, records)
     x, y, rel = flatten_valid(records)
     valid_flat = records["valid"].reshape(-1)
-    cls_valid = cls_scores.reshape(-1)[valid_flat]
     reg_valid = reg_scores.reshape(-1)[valid_flat]
-    regret_valid = regret_scores.reshape(-1)[valid_flat]
 
     frozen_mse = records["frozen_mse_channel"].mean().item()
     fixed_mse = records["fixed_mse_channel"].mean().item()
@@ -654,11 +667,7 @@ def evaluate_records(
         records["frozen_mse_channel"], records["fixed_mse_channel"]
     ).mean().item()
     continuous_oracle_mse = records["continuous_mse_channel"].mean().item()
-    cls_mse = mse_with_gate(records, cls_scores > cls_threshold)
-    cls_soft_mse = mse_with_gate(records, torch.sigmoid(cls_scores))
     reg_mse = mse_with_gate(records, reg_scores > reg_threshold)
-    regret_mse = mse_with_gate(records, regret_scores > regret_threshold)
-    regret_soft_mse = mse_with_gate(records, torch.sigmoid(regret_scores))
 
     def improvement(reference, value):
         return (reference - value) / max(reference, 1e-12) * 100.0
@@ -670,7 +679,7 @@ def evaluate_records(
     continuous_gain = frozen_mse - continuous_oracle_mse
     binary_gain = frozen_mse - binary_oracle_mse
     continuous_gamma = records["continuous_gamma_channel"]
-    return {
+    result = {
         "n_windows": int(records["features"].shape[0]),
         "n_channels": int(records["features"].shape[1]),
         "valid_label_frac": records["valid"].float().mean().item(),
@@ -685,17 +694,6 @@ def evaluate_records(
         ).float().mean().item(),
         "binary_capture_of_continuous_gain":
             binary_gain / max(continuous_gain, 1e-12),
-        "classifier": {
-            "auc": binary_auc(cls_valid, y),
-            "average_precision": average_precision(cls_valid, y),
-            "balanced_accuracy": balanced_accuracy(cls_valid, y, cls_threshold),
-            "threshold": cls_threshold,
-            "binary_mse": cls_mse,
-            "soft_mse": cls_soft_mse,
-            "binary_improvement_vs_frozen_pct": improvement(frozen_mse, cls_mse),
-            "binary_improvement_vs_fixed_pct": improvement(fixed_mse, cls_mse),
-            "binary_oracle_recovery": recovery(cls_mse),
-        },
         "regressor": {
             "auc": binary_auc(reg_valid, y),
             "average_precision": average_precision(reg_valid, y),
@@ -707,7 +705,27 @@ def evaluate_records(
             "binary_improvement_vs_fixed_pct": improvement(fixed_mse, reg_mse),
             "binary_oracle_recovery": recovery(reg_mse),
         },
-        "regret_classifier": {
+    }
+    if classifier is not None:
+        cls_scores = probe_scores(classifier, records)
+        cls_valid = cls_scores.reshape(-1)[valid_flat]
+        cls_mse = mse_with_gate(records, cls_scores > cls_threshold)
+        result["classifier"] = {
+            "auc": binary_auc(cls_valid, y),
+            "average_precision": average_precision(cls_valid, y),
+            "balanced_accuracy": balanced_accuracy(cls_valid, y, cls_threshold),
+            "threshold": cls_threshold,
+            "binary_mse": cls_mse,
+            "soft_mse": mse_with_gate(records, torch.sigmoid(cls_scores)),
+            "binary_improvement_vs_frozen_pct": improvement(frozen_mse, cls_mse),
+            "binary_improvement_vs_fixed_pct": improvement(fixed_mse, cls_mse),
+            "binary_oracle_recovery": recovery(cls_mse),
+        }
+    if regret_classifier is not None:
+        regret_scores = probe_scores(regret_classifier, records)
+        regret_valid = regret_scores.reshape(-1)[valid_flat]
+        regret_mse = mse_with_gate(records, regret_scores > regret_threshold)
+        result["regret_classifier"] = {
             "auc": binary_auc(regret_valid, y),
             "average_precision": average_precision(regret_valid, y),
             "balanced_accuracy": balanced_accuracy(
@@ -715,7 +733,7 @@ def evaluate_records(
             ),
             "threshold": regret_threshold,
             "binary_mse": regret_mse,
-            "soft_mse": regret_soft_mse,
+            "soft_mse": mse_with_gate(records, torch.sigmoid(regret_scores)),
             "binary_improvement_vs_frozen_pct": improvement(
                 frozen_mse, regret_mse
             ),
@@ -723,8 +741,8 @@ def evaluate_records(
                 fixed_mse, regret_mse
             ),
             "binary_oracle_recovery": recovery(regret_mse),
-        },
-    }
+        }
+    return result
 
 
 def print_summary(result):
@@ -741,6 +759,8 @@ def print_summary(result):
     print(f"Binary captures {h['binary_capture_of_continuous_gain']*100:.1f}% "
           f"of continuous oracle gain; mid-gamma={h['continuous_gamma_mid_frac']*100:.2f}%")
     for name in ("classifier", "regressor", "regret_classifier"):
+        if name not in h:
+            continue
         m = h[name]
         print(f"{name:10s}: AUC={m['auc']:.3f} AP={m['average_precision']:.3f} "
               f"BalAcc={m['balanced_accuracy']:.3f} MSE={m['binary_mse']:.6f} "
@@ -803,6 +823,11 @@ def main():
     p.add_argument("--probe_weight_decay", type=float, default=1e-4)
     p.add_argument("--probe_hidden", type=int, default=64,
                    help="0 for linear probe; >0 for a one-hidden-layer MLP")
+    p.add_argument(
+        "--final_regressor_only", action="store_true", default=False,
+        help=("Skip non-deployed diagnostic probes while preserving the exact "
+              "regressor RNG initialization and numerical result"),
+    )
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--patience", type=int, default=12)
     p.add_argument("--seed", type=int, default=2026)
@@ -887,36 +912,52 @@ def main():
         safety_selection_records = checkpoint_selection_records
         fit_records = train_records
 
-    classifier, cls_train = train_classifier(
-        fit_records, checkpoint_selection_records, args, device
-    )
+    if args.final_regressor_only:
+        consume_classifier_initialization_rng(fit_records, args, device)
+        classifier = None
+        cls_train = {"skipped": True, "reason": "final_regressor_only"}
+    else:
+        classifier, cls_train = train_classifier(
+            fit_records, checkpoint_selection_records, args, device
+        )
     regressor, reg_train = train_regressor(
         fit_records, checkpoint_selection_records, args, device
     )
-    regret_classifier, regret_train = train_regret_classifier(
-        fit_records, checkpoint_selection_records, args, device
-    )
+    if args.final_regressor_only:
+        regret_classifier = None
+        regret_train = {"skipped": True, "reason": "final_regressor_only"}
+    else:
+        regret_classifier, regret_train = train_regret_classifier(
+            fit_records, checkpoint_selection_records, args, device
+        )
     if args.validation_protocol == "fixed_zero_blocked":
         cls_threshold = 0.0
         reg_threshold = 0.0
-        cls_selection_mse = mse_with_gate(
-            checkpoint_selection_records,
-            probe_scores(classifier, checkpoint_selection_records) > cls_threshold,
+        cls_selection_mse = (
+            mse_with_gate(
+                checkpoint_selection_records,
+                probe_scores(classifier, checkpoint_selection_records) > cls_threshold,
+            )
+            if classifier is not None else None
         )
         reg_selection_mse = mse_with_gate(
             checkpoint_selection_records,
             probe_scores(regressor, checkpoint_selection_records) > reg_threshold,
         )
     else:
-        cls_selection_scores = probe_scores(
-            classifier, checkpoint_selection_records
+        cls_selection_scores = (
+            probe_scores(classifier, checkpoint_selection_records)
+            if classifier is not None else None
         )
         reg_selection_scores = probe_scores(
             regressor, checkpoint_selection_records
         )
-        cls_threshold, cls_selection_mse = tune_threshold(
-            cls_selection_scores, checkpoint_selection_records
-        )
+        if classifier is not None:
+            cls_threshold, cls_selection_mse = tune_threshold(
+                cls_selection_scores, checkpoint_selection_records
+            )
+        else:
+            cls_threshold, cls_selection_mse = 0.0, None
         reg_threshold, reg_selection_mse = tune_threshold(
             reg_selection_scores, checkpoint_selection_records
         )
@@ -1032,9 +1073,11 @@ def main():
         json.dump(result, f, indent=2, ensure_ascii=False)
     torch.save(
         {
-            "classifier": classifier.state_dict(),
+            "classifier": classifier.state_dict() if classifier is not None else None,
             "regressor": regressor.state_dict(),
-            "regret_classifier": regret_classifier.state_dict(),
+            "regret_classifier": (
+                regret_classifier.state_dict() if regret_classifier is not None else None
+            ),
             "classifier_threshold": cls_threshold,
             "regressor_threshold": reg_threshold,
             "decision_threshold": 0.0,
