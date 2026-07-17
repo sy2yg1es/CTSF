@@ -28,7 +28,7 @@ from models.binary_channel_gate import validate_gate_checkpoint
 HORIZONS = (1, 12, 24, 48)
 BACKBONES = ("patchtst", "itransformer")
 GATE_HISTORY = {1: 2000, 12: 8000, 24: 2000, 48: 2000}
-PROTOCOL_TAG = "binarygate_v1"
+DEFAULT_PROTOCOL_TAG = "binarygate_v1"
 
 
 def short_backbone(backbone: str) -> str:
@@ -43,17 +43,23 @@ def backbone_path(dataset: str, horizon: int, backbone: str) -> Path:
     return ROOT / "weights" / f"{backbone}_pretrained_{dataset}_H{horizon}.pth"
 
 
-def preferred_p1_path(dataset: str, horizon: int, backbone: str) -> Path:
+def preferred_p1_path(
+    dataset: str, horizon: int, backbone: str, protocol_tag: str
+) -> Path:
     short = short_backbone(backbone)
     return ROOT / "weights" / "prompt_z" / (
-        f"gfv2_{dataset}_H{horizon}_{short}_{PROTOCOL_TAG}_p1.pth"
+        f"gfv2_{dataset}_H{horizon}_{short}_{protocol_tag}_p1.pth"
     )
 
 
-def compatible_p1_candidates(dataset: str, horizon: int, backbone: str) -> list[Path]:
+def compatible_p1_candidates(
+    dataset: str, horizon: int, backbone: str, protocol_tag: str
+) -> list[Path]:
     """Return P1 candidates whose fit range can be disjoint from gate history."""
     short = short_backbone(backbone)
-    candidates = [preferred_p1_path(dataset, horizon, backbone)]
+    candidates = [preferred_p1_path(dataset, horizon, backbone, protocol_tag)]
+    if protocol_tag != DEFAULT_PROTOCOL_TAG:
+        return candidates
     if horizon == 12:
         # The 8k-tagged checkpoints were trained before an 8k gate tail.
         candidates.append(
@@ -68,21 +74,23 @@ def compatible_p1_candidates(dataset: str, horizon: int, backbone: str) -> list[
     return candidates
 
 
-def gate_path(dataset: str, horizon: int, backbone: str, seed: int) -> Path:
+def gate_path(
+    dataset: str, horizon: int, backbone: str, seed: int, protocol_tag: str
+) -> Path:
     short = short_backbone(backbone)
     return ROOT / "weights" / "prompt_z" / "gate_probe" / (
         f"gate_probe_{dataset}_H{horizon}_causal_augmented_s{seed}_"
-        f"{short}_{PROTOCOL_TAG}.pth"
+        f"{short}_{protocol_tag}.pth"
     )
 
 
 def test_result_path(
-    dataset: str, horizon: int, backbone: str, out_dir: Path
+    dataset: str, horizon: int, backbone: str, out_dir: Path, protocol_tag: str
 ) -> Path:
     short = short_backbone(backbone)
     return out_dir / (
         f"binary_gate_test_{dataset}_H{horizon}_{backbone}_"
-        f"{short}_{PROTOCOL_TAG}.json"
+        f"{short}_{protocol_tag}.json"
     )
 
 
@@ -121,17 +129,31 @@ def load_test_result(path: Path, expected_gate: Path):
         return None
 
 
-def resolve_p1(dataset: str, horizon: int, backbone: str, checkpoint=None):
+def is_valid_p1_checkpoint(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        return isinstance(state, dict) and bool(state)
+    except Exception:
+        return False
+
+
+def resolve_p1(
+    dataset: str, horizon: int, backbone: str, protocol_tag: str, checkpoint=None
+):
     if checkpoint is not None:
         saved = checkpoint.get("config", {}).get("p1_ckpt")
         if saved:
             saved_path = Path(saved)
             if not saved_path.is_absolute():
                 saved_path = ROOT / saved_path
-            if saved_path.exists():
+            if is_valid_p1_checkpoint(saved_path):
                 return saved_path
-    for candidate in compatible_p1_candidates(dataset, horizon, backbone):
-        if candidate.exists():
+    for candidate in compatible_p1_candidates(
+        dataset, horizon, backbone, protocol_tag
+    ):
+        if is_valid_p1_checkpoint(candidate):
             return candidate
     return None
 
@@ -170,7 +192,7 @@ def p1_command(args, dataset, horizon, backbone, output: Path) -> list[str]:
         "--d_drift", "64",
         "--rank", "8",
         "--gamma_init_bias", "0",
-        "--max_delta_ratio", "0.02",
+        "--max_delta_ratio", str(args.max_delta_ratio),
         "--residual_window_K", "24",
         "--phase1_steps", str(args.p1_steps),
         # Reserve the complete gate tail so P1 and gate labels never overlap.
@@ -185,7 +207,7 @@ def p1_command(args, dataset, horizon, backbone, output: Path) -> list[str]:
         "--num_workers", str(args.num_workers),
         "--log_interval", str(args.log_interval),
         "--save_dir", relative(output.parent),
-        "--experiment_tag", f"{short}_{PROTOCOL_TAG}",
+        "--experiment_tag", f"{short}_{args.protocol_tag}",
     ]
 
 
@@ -202,7 +224,7 @@ def gate_command(args, dataset, horizon, backbone, p1: Path) -> list[str]:
         "--p1_ckpt", relative(p1),
         "--d_drift", "64",
         "--rank", "8",
-        "--max_delta_ratio", "0.02",
+        "--max_delta_ratio", str(args.max_delta_ratio),
         "--residual_window_K", "24",
         "--train_steps", str(GATE_HISTORY[horizon]),
         "--val_steps", str(args.val_steps),
@@ -224,7 +246,7 @@ def gate_command(args, dataset, horizon, backbone, p1: Path) -> list[str]:
         "--safe_min_positive_block_frac", "0.75",
         "--num_workers", str(args.num_workers),
         "--log_interval", str(args.log_interval),
-        "--experiment_tag", f"{short}_{PROTOCOL_TAG}",
+        "--experiment_tag", f"{short}_{args.protocol_tag}",
     ]
 
 
@@ -242,11 +264,11 @@ def test_command(args, dataset, horizon, backbone, p1: Path, gate: Path) -> list
         "--gate_ckpt", relative(gate),
         "--d_drift", "64",
         "--rank", "8",
-        "--max_delta_ratio", "0.02",
+        "--max_delta_ratio", str(args.max_delta_ratio),
         "--residual_window_K", "24",
         "--num_workers", str(args.num_workers),
         "--out_dir", relative(args.out_dir),
-        "--experiment_tag", f"{short}_{PROTOCOL_TAG}",
+        "--experiment_tag", f"{short}_{args.protocol_tag}",
     ]
 
 
@@ -264,10 +286,16 @@ def preflight(args, cases):
     rows = []
     for dataset, horizon, backbone in cases:
         backbone_file = backbone_path(dataset, horizon, backbone)
-        gate_file = gate_path(dataset, horizon, backbone, args.seed)
+        gate_file = gate_path(
+            dataset, horizon, backbone, args.seed, args.protocol_tag
+        )
         checkpoint, gate_status = load_gate(gate_file)
-        p1 = resolve_p1(dataset, horizon, backbone, checkpoint)
-        result_file = test_result_path(dataset, horizon, backbone, args.out_dir)
+        p1 = resolve_p1(
+            dataset, horizon, backbone, args.protocol_tag, checkpoint
+        )
+        result_file = test_result_path(
+            dataset, horizon, backbone, args.out_dir, args.protocol_tag
+        )
         result = load_test_result(result_file, gate_file)
         rows.append({
             "case": case_key(dataset, horizon, backbone),
@@ -305,12 +333,18 @@ def prepare_all(args, cases, manifest):
             save_manifest(args.manifest, manifest)
             continue
 
-        gate_file = gate_path(dataset, horizon, backbone, args.seed)
+        gate_file = gate_path(
+            dataset, horizon, backbone, args.seed, args.protocol_tag
+        )
         checkpoint, gate_status = load_gate(gate_file)
-        p1 = resolve_p1(dataset, horizon, backbone, checkpoint)
+        p1 = resolve_p1(
+            dataset, horizon, backbone, args.protocol_tag, checkpoint
+        )
         p1_rebuilt = False
         if args.force_prepare or p1 is None:
-            p1 = preferred_p1_path(dataset, horizon, backbone)
+            p1 = preferred_p1_path(
+                dataset, horizon, backbone, args.protocol_tag
+            )
             p1_rebuilt = True
             state["status"] = "p1_running"
             save_manifest(args.manifest, manifest)
@@ -345,7 +379,9 @@ def prepare_all(args, cases, manifest):
         state.update(
             status="prepared",
             backbone=relative(backbone_file),
-            p1=relative(resolve_p1(dataset, horizon, backbone, checkpoint)),
+            p1=relative(resolve_p1(
+                dataset, horizon, backbone, args.protocol_tag, checkpoint
+            )),
             gate=relative(gate_file),
             selected_mode=checkpoint["selected_mode"],
         )
@@ -359,9 +395,13 @@ def test_all(args, cases, manifest):
         key = case_key(dataset, horizon, backbone)
         state = manifest["cases"].setdefault(key, {})
         backbone_file = backbone_path(dataset, horizon, backbone)
-        gate_file = gate_path(dataset, horizon, backbone, args.seed)
+        gate_file = gate_path(
+            dataset, horizon, backbone, args.seed, args.protocol_tag
+        )
         checkpoint, gate_status = load_gate(gate_file)
-        p1 = resolve_p1(dataset, horizon, backbone, checkpoint)
+        p1 = resolve_p1(
+            dataset, horizon, backbone, args.protocol_tag, checkpoint
+        )
         if not backbone_file.exists() or p1 is None or gate_status != "valid":
             reason = {
                 "backbone": backbone_file.exists(),
@@ -389,7 +429,9 @@ def test_all(args, cases, manifest):
     for dataset, horizon, backbone, p1, gate_file in ready:
         key = case_key(dataset, horizon, backbone)
         state = manifest["cases"].setdefault(key, {})
-        result_file = test_result_path(dataset, horizon, backbone, args.out_dir)
+        result_file = test_result_path(
+            dataset, horizon, backbone, args.out_dir, args.protocol_tag
+        )
         result = load_test_result(result_file, gate_file)
         if args.force_test or result is None:
             state["status"] = "test_running"
@@ -451,6 +493,8 @@ def parse_args():
         "--backbones", nargs="+", choices=BACKBONES, default=list(BACKBONES)
     )
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--max_delta_ratio", type=float, default=0.02)
+    parser.add_argument("--protocol_tag", default=DEFAULT_PROTOCOL_TAG)
     parser.add_argument("--p1_steps", type=int, default=2000)
     parser.add_argument("--p1_val_interval", type=int, default=200)
     parser.add_argument("--val_steps", type=int, default=2000)
@@ -459,11 +503,10 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
-        "--manifest", type=Path,
-        default=ROOT / "logs/prompt_z/test_matrix_manifest.json",
+        "--manifest", type=Path, default=None,
     )
     parser.add_argument(
-        "--out_dir", type=Path, default=ROOT / "logs/prompt_z/test_matrix"
+        "--out_dir", type=Path, default=None
     )
     parser.add_argument("--force_prepare", action="store_true")
     parser.add_argument("--force_test", action="store_true")
@@ -472,6 +515,33 @@ def parse_args():
     args = parser.parse_args()
 
     args.dataset_dir = args.dataset_dir.resolve()
+    if not (0.0 < args.max_delta_ratio <= 1.0):
+        parser.error("--max_delta_ratio must be in (0, 1]")
+    allowed_tag_chars = (
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    )
+    if any(char not in allowed_tag_chars for char in args.protocol_tag):
+        parser.error("--protocol_tag may contain only letters, digits, '_' and '-'")
+    if (
+        args.max_delta_ratio != 0.02
+        and args.protocol_tag == DEFAULT_PROTOCOL_TAG
+    ):
+        parser.error(
+            "A non-default --max_delta_ratio requires a distinct --protocol_tag "
+            "so existing 0.02 artifacts cannot be overwritten"
+        )
+    if args.manifest is None:
+        suffix = (
+            "" if args.protocol_tag == DEFAULT_PROTOCOL_TAG
+            else f"_{args.protocol_tag}"
+        )
+        args.manifest = ROOT / f"logs/prompt_z/test_matrix_manifest{suffix}.json"
+    if args.out_dir is None:
+        suffix = (
+            "" if args.protocol_tag == DEFAULT_PROTOCOL_TAG
+            else f"_{args.protocol_tag}"
+        )
+        args.out_dir = ROOT / f"logs/prompt_z/test_matrix{suffix}"
     args.manifest = args.manifest.resolve()
     args.out_dir = args.out_dir.resolve()
     if args.datasets is None:
@@ -495,7 +565,13 @@ def main():
     manifest = (
         json.loads(args.manifest.read_text(encoding="utf-8"))
         if args.manifest.exists()
-        else {"protocol": "binary_channel_gate_v1", "seed": args.seed, "cases": {}}
+        else {
+            "protocol": "binary_channel_gate_v1",
+            "protocol_tag": args.protocol_tag,
+            "max_delta_ratio": args.max_delta_ratio,
+            "seed": args.seed,
+            "cases": {},
+        }
     )
     if manifest.get("protocol") != "binary_channel_gate_v1":
         raise ValueError(f"Refusing incompatible manifest: {args.manifest}")
@@ -503,10 +579,22 @@ def main():
         raise ValueError(
             f"Manifest seed={manifest.get('seed')} does not match requested seed={args.seed}"
         )
+    if manifest.get("protocol_tag", DEFAULT_PROTOCOL_TAG) != args.protocol_tag:
+        raise ValueError(
+            f"Manifest protocol_tag={manifest.get('protocol_tag')} does not match "
+            f"requested protocol_tag={args.protocol_tag}"
+        )
+    saved_max_delta_ratio = float(manifest.get("max_delta_ratio", 0.02))
+    if abs(saved_max_delta_ratio - args.max_delta_ratio) > 1e-12:
+        raise ValueError(
+            f"Manifest max_delta_ratio={manifest.get('max_delta_ratio')} does not "
+            f"match requested max_delta_ratio={args.max_delta_ratio}"
+        )
 
     print(
         f"[*] mode={args.mode} datasets={len(args.datasets)} cases={len(cases)} "
-        f"seed={args.seed} dry_run={args.dry_run}"
+        f"seed={args.seed} max_delta_ratio={args.max_delta_ratio} "
+        f"protocol_tag={args.protocol_tag} dry_run={args.dry_run}"
     )
     print_preflight(preflight(args, cases))
     started = time.perf_counter()

@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from collections import deque
@@ -70,6 +71,66 @@ from data_provider.data_loader import data_provider
 from models.backbone_adapter import PatchTSTAdapter, iTransformerAdapter
 from models.prompt_z import PromptZModulator
 from core.residual_tracker import ResidualTracker
+
+
+def _storage_diagnostics(path: Path) -> str:
+    """Return useful filesystem state without masking the original save error."""
+    parent = path.parent
+    details = []
+    try:
+        usage = shutil.disk_usage(parent)
+        details.append(
+            f"disk_free={usage.free / (1024 ** 3):.3f} GiB "
+            f"disk_total={usage.total / (1024 ** 3):.3f} GiB"
+        )
+    except OSError as error:
+        details.append(f"disk_usage_error={error}")
+    if hasattr(os, "statvfs"):
+        try:
+            stats = os.statvfs(parent)
+            details.append(
+                f"free_inodes={stats.f_favail} total_inodes={stats.f_files}"
+            )
+        except OSError as error:
+            details.append(f"inode_usage_error={error}")
+    return "; ".join(details)
+
+
+def atomic_torch_save(payload, destination: str | Path) -> None:
+    """Save without exposing a partially written checkpoint.
+
+    The legacy serializer retry handles filesystems on which PyTorch's zip
+    writer raises ``unexpected pos`` despite sufficient storage. Both attempts
+    write a sibling temporary file, so an existing valid best checkpoint is
+    preserved until a complete replacement is ready.
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.tmp-{os.getpid()}"
+    )
+    errors = []
+    for use_new_zipfile in (True, False):
+        try:
+            temporary.unlink(missing_ok=True)
+            torch.save(
+                payload,
+                temporary,
+                _use_new_zipfile_serialization=use_new_zipfile,
+            )
+            os.replace(temporary, destination)
+            return
+        except Exception as error:
+            errors.append(
+                f"{'zip' if use_new_zipfile else 'legacy'}={error!r}"
+            )
+            temporary.unlink(missing_ok=True)
+    diagnostics = _storage_diagnostics(destination)
+    raise RuntimeError(
+        f"Failed to save checkpoint atomically: {destination}. "
+        f"{diagnostics}. Attempts: {'; '.join(errors)}. "
+        "On the server check `df -h`, `df -i`, and `quota -s`."
+    ) from None
 
 
 # ============================================================================
@@ -565,7 +626,7 @@ def run_phase1(adapter, prompt_z, p1_subset, val_loader,
                   + ("  → new best" if vr_snap["val_mse_fixed_gamma1"] < best_val else ""))
             if vr_snap["val_mse_fixed_gamma1"] < best_val:
                 best_val = vr_snap["val_mse_fixed_gamma1"]
-                torch.save(prompt_z.state_dict(), ckpt)
+                atomic_torch_save(prompt_z.state_dict(), ckpt)
                 checkpoint_update = True
             else:
                 checkpoint_update = False
@@ -589,7 +650,7 @@ def run_phase1(adapter, prompt_z, p1_subset, val_loader,
     if best_val == float("inf"):
         vr_snap = evaluate_val_p1(adapter, prompt_z, val_loader, args, device)
         best_val = vr_snap["val_mse_fixed_gamma1"]
-        torch.save(prompt_z.state_dict(), ckpt)
+        atomic_torch_save(prompt_z.state_dict(), ckpt)
 
     dt = time.time() - t0
     print(f"\n[P1] Done {dt:.0f}s  best_val_fixed_gamma1={best_val:.6f}  ckpt={ckpt}")
@@ -704,7 +765,7 @@ def run_phase2(adapter, prompt_z, p1_subset, p2_subset, val_loader,
             print_val(vr, label=f"P2 Val@{step}")
             if vr["val_mse_learned_gamma"] < best_val:
                 best_val = vr["val_mse_learned_gamma"]
-                torch.save(prompt_z.state_dict(), best_path)
+                atomic_torch_save(prompt_z.state_dict(), best_path)
                 print(f"  → val best={best_val:.6f}")
             log_f.write(json.dumps({
                 "phase": 2, "step": step, "val_snapshot": True, **vr
@@ -725,8 +786,8 @@ def run_phase2(adapter, prompt_z, p1_subset, p2_subset, val_loader,
     print_val(vr, label="P2 Val Final")
     if vr["val_mse_learned_gamma"] < best_val:
         best_val = vr["val_mse_learned_gamma"]
-        torch.save(prompt_z.state_dict(), best_path)
-    torch.save(prompt_z.state_dict(), final_path)
+        atomic_torch_save(prompt_z.state_dict(), best_path)
+    atomic_torch_save(prompt_z.state_dict(), final_path)
 
     print(f"\n[P2] Done {time.time()-t0:.0f}s  best_val={best_val:.6f}")
     print(f"[P2] Best : {best_path}")
